@@ -1,14 +1,21 @@
 import argparse
 import json
 import sys
+import uuid
 
 from . import __version__
-from .config import LLMSettings, PROJECT_ROOT, WORKSPACE_ROOT
+from .config import (
+    LLMSettings,
+    PROJECT_ROOT,
+    STATE_DB,
+    WORKSPACE_ROOT,
+)
 from .engine import AgentEngine, AgentError
 from .llm import LLMError, OpenAICompatibleClient
 from .models import ToolCall, ToolResult
 from .runtime.executor import Executor
 from .runtime.policy import Policy
+from .runtime.store import RunStore, StoreError
 from .tools import build_tool_registry
 
 
@@ -64,7 +71,6 @@ def build_parser() -> argparse.ArgumentParser:
     model_parser = subparsers.add_parser(
         "model-test",
         help="проверить подключение к языковой модели",
-        description="проверка подключения к языковой модели",
         add_help=False,
     )
 
@@ -90,8 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="запустить агента для выполнения задачи",
-        description="запуск агента для работы с проектом",
+        help="запустить агента",
         add_help=False,
     )
 
@@ -105,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "prompt",
         type=str,
-        help="задача для выполнения",
+        help="задача для агента",
     )
 
     run_parser.add_argument(
@@ -113,6 +118,44 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="максимальное количество обращений к модели",
+    )
+
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="продолжить сохранённый запуск",
+        add_help=False,
+    )
+
+    resume_parser.add_argument(
+        "run_id",
+        type=str,
+    )
+
+    resolve_parser = subparsers.add_parser(
+        "resolve",
+        help="разрешить неопределённое действие",
+        add_help=False,
+    )
+
+    resolve_parser.add_argument(
+        "run_id",
+        type=str,
+    )
+
+    resolve_parser.add_argument(
+        "action",
+        choices=["retry", "skip", "abort"],
+    )
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="посмотреть состояние запуска",
+        add_help=False,
+    )
+
+    status_parser.add_argument(
+        "run_id",
+        type=str,
     )
 
     return parser
@@ -159,11 +202,9 @@ def run_model_test(args: argparse.Namespace) -> int:
             "role": "system",
             "content": (
                 "ты помощник по программированию "
-                "отвечай пользователю по-русски, "
+                "отвечай пользователю по-русски "
                 "начинай сообщения со строчной буквы "
-                "и не ставь точку в конце сообщения "
-                "если доступны инструменты, ты можешь "
-                "запрашивать их вызовы "
+                "не ставь точку в конце сообщения "
                 "не утверждай, что выполнил инструмент, "
                 "пока не получишь его результат"
             ),
@@ -174,18 +215,13 @@ def run_model_test(args: argparse.Namespace) -> int:
         },
     ]
 
-    try:
-        settings = LLMSettings.from_env()
-        client = OpenAICompatibleClient(settings)
+    settings = LLMSettings.from_env()
+    client = OpenAICompatibleClient(settings)
 
-        response = client.complete(
-            messages,
-            tools=tools,
-        )
-
-    except (LLMError, ValueError) as exc:
-        print(f"ошибка: {exc}", file=sys.stderr)
-        return 1
+    response = client.complete(
+        messages,
+        tools=tools,
+    )
 
     if response.tool_calls:
         for call in response.tool_calls:
@@ -207,11 +243,10 @@ def run_model_test(args: argparse.Namespace) -> int:
         )
 
     else:
-        content = format_model_text(
-            response.content or ""
+        print(
+            "ответ модели: "
+            + format_model_text(response.content or "")
         )
-
-        print(f"ответ модели: {content}")
 
         if args.tools:
             print("модель не запросила инструменты")
@@ -245,71 +280,223 @@ def print_tool_result(
             print("вывод команды был обрезан")
 
 
-def run_agent(args: argparse.Namespace) -> int:
-    try:
-        settings = LLMSettings.from_env()
+def build_engine(
+    max_steps: int = 20,
+) -> AgentEngine:
+    settings = LLMSettings.from_env()
 
-        policy = Policy(
-            PROJECT_ROOT / "policy.json",
-            WORKSPACE_ROOT,
-        )
+    policy = Policy(
+        PROJECT_ROOT / "policy.json",
+        WORKSPACE_ROOT,
+    )
 
-        registry = build_tool_registry(
-            WORKSPACE_ROOT,
-            policy=policy,
-        )
+    registry = build_tool_registry(
+        WORKSPACE_ROOT,
+        policy=policy,
+    )
 
-        executor = Executor(
-            registry=registry,
-            policy=policy,
-        )
+    executor = Executor(
+        registry=registry,
+        policy=policy,
+    )
 
-        llm = OpenAICompatibleClient(settings)
+    store = RunStore(STATE_DB)
 
-        engine = AgentEngine(
-            llm=llm,
-            registry=registry,
-            executor=executor,
-            max_steps=args.max_steps,
-            on_tool_result=print_tool_result,
-        )
+    llm = OpenAICompatibleClient(settings)
 
-        print("агент запущен")
+    return AgentEngine(
+        llm=llm,
+        registry=registry,
+        executor=executor,
+        store=store,
+        max_steps=max_steps,
+        on_tool_result=print_tool_result,
+    )
 
-        result = engine.run(args.prompt)
 
-    except (LLMError, AgentError, ValueError, OSError) as exc:
-        print(f"ошибка: {exc}", file=sys.stderr)
-        return 1
-
+def print_run_result(
+    engine: AgentEngine,
+    result,
+) -> int:
+    print(f"идентификатор запуска: {result.run_id}")
+    print(f"состояние запуска: {result.status}")
     print(f"обращений к модели: {result.model_calls}")
     print(f"вызовов инструментов: {result.tool_calls}")
 
+    if result.status == "completed":
+        print(
+            "ответ агента: "
+            + format_model_text(
+                result.final_answer or ""
+            )
+        )
+        return 0
+
     if result.status == "limit_reached":
         print(
-            "достигнут лимит обращений к модели, "
-            "выполнение задачи остановлено",
+            "достигнут лимит обращений к модели",
             file=sys.stderr,
         )
         return 2
 
-    print(
-        "ответ агента: "
-        + format_model_text(result.final_answer or "")
-    )
+    if result.status == "failed":
+        print(
+            "запуск завершён с ошибкой",
+            file=sys.stderr,
+        )
+        return 1
+
+    if result.status == "waiting_resolution":
+        call = engine.store.get_uncertain(
+            result.run_id
+        )
+
+        print(
+            "обнаружено действие с неопределённым результатом"
+        )
+
+        if call is not None:
+            print(f"инструмент: {call['name']}")
+            print(f"идентификатор вызова: {call['call_id']}")
+
+            if call["name"] in (
+                "read_file",
+                "list_files",
+            ):
+                print(
+                    "доступные решения: retry, skip, abort"
+                )
+            else:
+                print(
+                    "повторение этого инструмента небезопасно"
+                )
+                print(
+                    "доступные решения: skip, abort"
+                )
+
+        print(
+            f"для продолжения используй команду "
+            f"python -m agent_my resolve {result.run_id} <решение>"
+        )
+
+        return 3
 
     return 0
+
+
+def run_agent(args: argparse.Namespace) -> int:
+    engine = build_engine(
+        max_steps=args.max_steps
+    )
+
+    run_id = str(uuid.uuid4())
+
+    print("агент запущен")
+    print(f"идентификатор запуска: {run_id}")
+
+    result = engine.run(
+        args.prompt,
+        run_id=run_id,
+    )
+
+    return print_run_result(
+        engine,
+        result,
+    )
+
+
+def resume_agent(run_id: str) -> int:
+    engine = build_engine()
+
+    result = engine.resume(run_id)
+
+    return print_run_result(
+        engine,
+        result,
+    )
+
+
+def resolve_action(
+    run_id: str,
+    action: str,
+) -> int:
+    engine = build_engine()
+
+    result = engine.resolve(
+        run_id,
+        action,
+    )
+
+    return print_run_result(
+        engine,
+        result,
+    )
+
+
+def show_status(run_id: str) -> int:
+    store = RunStore(STATE_DB)
+
+    try:
+        run = store.get_run(run_id)
+
+        print(f"идентификатор запуска: {run_id}")
+        print(f"состояние запуска: {run['status']}")
+        print(
+            f"обращений к модели: {run['model_calls']}"
+        )
+        print(
+            f"вызовов инструментов: {run['tool_calls']}"
+        )
+
+        if run["status"] == "waiting_resolution":
+            call = store.get_uncertain(run_id)
+
+            if call is not None:
+                print(
+                    f"неопределённый инструмент: {call['name']}"
+                )
+
+        return 0
+
+    finally:
+        store.close()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "model-test":
-        return run_model_test(args)
+    try:
+        if args.command == "model-test":
+            return run_model_test(args)
 
-    if args.command == "run":
-        return run_agent(args)
+        if args.command == "run":
+            return run_agent(args)
 
-    parser.print_help()
-    return 0
+        if args.command == "resume":
+            return resume_agent(args.run_id)
+
+        if args.command == "resolve":
+            return resolve_action(
+                args.run_id,
+                args.action,
+            )
+
+        if args.command == "status":
+            return show_status(args.run_id)
+
+        parser.print_help()
+        return 0
+
+    except (
+        LLMError,
+        AgentError,
+        StoreError,
+        ValueError,
+        OSError,
+    ) as exc:
+        print(
+            f"ошибка: {exc}",
+            file=sys.stderr,
+        )
+        return 1
