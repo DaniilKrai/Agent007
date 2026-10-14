@@ -4,13 +4,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-
 @dataclass(frozen=True)
 class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
-
 
 @dataclass(frozen=True)
 class ToolResult:
@@ -37,3 +35,33 @@ class ToolResult:
             "tool_call_id": self.tool_call_id,
             "content": json.dumps(content, ensure_ascii=False),
         }
+
+@dataclass(frozen=True)
+class LLMResponse:
+    content: str | None
+    tool_calls: tuple[ToolCall, ...] = ()
+    finish_reason: str | None = None
+
+    def to_assistant_message(self) -> dict[str, Any]:
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": self.content,
+        }
+
+        if self.tool_calls:
+            message["tool_calls"] = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": json.dumps(
+                            call.arguments,
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+                for call in self.tool_calls
+            ]
+
+        return message

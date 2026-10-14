@@ -1,28 +1,29 @@
-
 from pathlib import Path, PureWindowsPath
 
 
 class FileTools:
     def __init__(self, workspace_root: Path):
-        self.root = workspace_root.resolve(strict=True)
+        root = workspace_root.resolve(strict=False)
 
-        if not self.root.is_dir():
-            raise ValueError("Workspace must be a directory")
+        if not root.is_dir():
+            raise ValueError("рабочая директория не найдена")
+
+        self.root = root.resolve(strict=True)
 
     def _resolve(self, path: str) -> Path:
         if not isinstance(path, str) or not path:
-            raise ValueError("Path must be a non-empty string")
+            raise ValueError("путь должен быть непустой строкой")
 
         if "\0" in path or "\\" in path:
-            raise ValueError("Invalid path")
+            raise ValueError("недопустимый путь")
 
         relative = Path(path)
 
         if relative.is_absolute() or PureWindowsPath(path).drive:
-            raise PermissionError("Absolute paths are forbidden")
+            raise PermissionError("абсолютные пути запрещены")
 
         if ".." in relative.parts:
-            raise PermissionError("Parent traversal is forbidden")
+            raise PermissionError("переход в родительскую директорию запрещён")
 
         current = self.root
 
@@ -30,12 +31,12 @@ class FileTools:
             current = current / part
 
             if current.is_symlink():
-                raise PermissionError("Symbolic links are forbidden")
+                raise PermissionError("использование символьных ссылок запрещено")
 
         resolved = current.resolve(strict=False)
 
         if not resolved.is_relative_to(self.root):
-            raise PermissionError("Path is outside workspace")
+            raise PermissionError("путь находится за пределами рабочей директории")
 
         return resolved
 
@@ -43,7 +44,7 @@ class FileTools:
         target = self._resolve(path)
 
         if not target.is_dir():
-            raise NotADirectoryError(path)
+            raise NotADirectoryError(f"не является директорией: {path}")
 
         items = []
 
@@ -70,7 +71,7 @@ class FileTools:
         target = self._resolve(path)
 
         if not target.is_file():
-            raise FileNotFoundError(path)
+            raise FileNotFoundError(f"файл не найден: {path}")
 
         content = target.read_text(encoding="utf-8")
 
@@ -83,10 +84,14 @@ class FileTools:
         target = self._resolve(path)
 
         if not target.parent.is_dir():
-            raise FileNotFoundError("Parent directory does not exist")
+            raise FileNotFoundError(
+                f"родительская директория не найдена: {path}"
+            )
 
         if target.is_dir():
-            raise IsADirectoryError(path)
+            raise IsADirectoryError(
+                f"нельзя записать файл вместо директории: {path}"
+            )
 
         existed = target.exists()
         target.write_text(content, encoding="utf-8")
@@ -101,7 +106,7 @@ class FileTools:
         target = self._resolve(path)
 
         if not target.is_file():
-            raise FileNotFoundError(path)
+            raise FileNotFoundError(f"файл не найден: {path}")
 
         target.unlink()
 

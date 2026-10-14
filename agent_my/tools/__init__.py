@@ -1,4 +1,3 @@
-
 from pathlib import Path
 
 from .filesystem import FileTools
@@ -12,12 +11,12 @@ def build_tool_registry(workspace_root: Path) -> ToolRegistry:
     path_schema = {
         "type": "string",
         "minLength": 1,
-        "description": "Relative path inside workspace",
+        "description": "относительный путь внутри рабочей директории",
     }
 
     registry.register(
         name="list_files",
-        description="List files and directories inside workspace",
+        description="получить список файлов и директорий",
         parameters={
             "type": "object",
             "properties": {
@@ -31,7 +30,7 @@ def build_tool_registry(workspace_root: Path) -> ToolRegistry:
 
     registry.register(
         name="read_file",
-        description="Read a UTF-8 text file inside workspace",
+        description="прочитать текстовый файл в кодировке utf-8",
         parameters={
             "type": "object",
             "properties": {
@@ -45,14 +44,14 @@ def build_tool_registry(workspace_root: Path) -> ToolRegistry:
 
     registry.register(
         name="write_file",
-        description="Create or replace a UTF-8 text file inside workspace",
+        description="создать или перезаписать текстовый файл",
         parameters={
             "type": "object",
             "properties": {
                 "path": path_schema,
                 "content": {
                     "type": "string",
-                    "description": "Complete new file content",
+                    "description": "полное новое содержимое файла",
                 },
             },
             "required": ["path", "content"],
@@ -63,7 +62,7 @@ def build_tool_registry(workspace_root: Path) -> ToolRegistry:
 
     registry.register(
         name="delete_file",
-        description="Delete a file inside workspace",
+        description="удалить файл внутри рабочей директории",
         parameters={
             "type": "object",
             "properties": {

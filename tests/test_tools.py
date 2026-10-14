@@ -111,19 +111,25 @@ class ToolRegistryTest(unittest.TestCase):
         result = self.call("unknown_tool", path="order.py")
 
         self.assertFalse(result.success)
-        self.assertIn("Unknown tool", result.error)
+        self.assertIn("неизвестный инструмент", result.error)
 
     def test_missing_argument(self):
         result = self.call("read_file")
 
         self.assertFalse(result.success)
-        self.assertIn("Invalid arguments", result.error)
+        self.assertIn(
+            "отсутствует обязательный аргумент",
+            result.error,
+        )
 
     def test_wrong_argument_type(self):
         result = self.call("read_file", path=123)
 
         self.assertFalse(result.success)
-        self.assertIn("Invalid arguments", result.error)
+        self.assertIn(
+            "неверный тип аргумента",
+            result.error,
+        )
 
     def test_extra_argument(self):
         result = self.call(
@@ -133,13 +139,13 @@ class ToolRegistryTest(unittest.TestCase):
         )
 
         self.assertFalse(result.success)
-        self.assertIn("Invalid arguments", result.error)
+        self.assertIn("неизвестные аргументы", result.error)
 
     def test_missing_file(self):
         result = self.call("read_file", path="missing.py")
 
         self.assertFalse(result.success)
-        self.assertIn("FileNotFoundError", result.error)
+        self.assertIn("файл не найден", result.error)
 
     def test_parent_traversal(self):
         result = self.call(
@@ -148,7 +154,10 @@ class ToolRegistryTest(unittest.TestCase):
         )
 
         self.assertFalse(result.success)
-        self.assertIn("PermissionError", result.error)
+        self.assertIn(
+            "переход в родительскую директорию запрещён",
+            result.error,
+        )
 
     def test_absolute_path(self):
         result = self.call(
@@ -158,6 +167,7 @@ class ToolRegistryTest(unittest.TestCase):
         )
 
         self.assertFalse(result.success)
+        self.assertIn("абсолютные пути запрещены", result.error)
         self.assertFalse(
             (Path(self.temp.name) / "outside.txt").exists()
         )
@@ -172,8 +182,12 @@ class ToolRegistryTest(unittest.TestCase):
         for name in ("read_file", "delete_file"):
             with self.subTest(tool=name):
                 result = self.call(name, path="link.txt")
+
                 self.assertFalse(result.success)
-                self.assertIn("PermissionError", result.error)
+                self.assertIn(
+                    "использование символьных ссылок запрещено",
+                    result.error,
+                )
 
         result = self.call(
             "write_file",
@@ -182,6 +196,11 @@ class ToolRegistryTest(unittest.TestCase):
         )
 
         self.assertFalse(result.success)
+        self.assertIn(
+            "использование символьных ссылок запрещено",
+            result.error,
+        )
+
         self.assertEqual(
             outside.read_text(encoding="utf-8"),
             "secret",
@@ -190,6 +209,7 @@ class ToolRegistryTest(unittest.TestCase):
     def test_symlink_directory(self):
         outside = Path(self.temp.name) / "outside"
         outside.mkdir()
+
         (outside / "secret.txt").write_text(
             "secret",
             encoding="utf-8",
@@ -206,7 +226,10 @@ class ToolRegistryTest(unittest.TestCase):
         )
 
         self.assertFalse(result.success)
-        self.assertIn("PermissionError", result.error)
+        self.assertIn(
+            "использование символьных ссылок запрещено",
+            result.error,
+        )
 
     def test_tool_message(self):
         result = self.call("read_file", path="order.py")
