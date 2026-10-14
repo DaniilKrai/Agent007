@@ -64,7 +64,7 @@ class ToolRegistry:
         return result
 
     @staticmethod
-    def _validation_message(error: ValidationError) -> str:
+    def validation_message(error: ValidationError) -> str:
         argument = ".".join(str(part) for part in error.path)
 
         if error.validator == "required":
@@ -135,7 +135,7 @@ class ToolRegistry:
         errors = list(validator.iter_errors(call.arguments))
 
         if errors:
-            message = self._validation_message(errors[0])
+            message = self.validation_message(errors[0])
 
             return ToolResult(
                 tool_call_id=call.id,

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 from .filesystem import FileTools
 from .registry import ToolRegistry
 from agent_my.runtime.planning import PLAN_SCHEMA, submit_plan
+from agent_my.runtime.tasks import COMPLETE_TASK_SCHEMA, complete_task
 
 if TYPE_CHECKING:
     from agent_my.runtime.policy import Policy
@@ -15,6 +16,13 @@ def build_tool_registry(
 ) -> ToolRegistry:
     files = FileTools(workspace_root)
     registry = ToolRegistry()
+
+    registry.register(
+        name="complete_task",
+        description="завершить текущую задачу после проверки результатов её инструментов, evidence содержит tool_call_id",
+        parameters=COMPLETE_TASK_SCHEMA,
+        handler=complete_task,
+    )
 
     registry.register(
         name="submit_plan",
@@ -96,7 +104,7 @@ def build_tool_registry(
 
         registry.register(
             name="Bash",
-            description="выполнить разрешённую команду через bash",
+            description='выполнить разрешённую команду через bash, обязательны command и cwd, для корня проекта cwd="."',
             parameters={
                 "type": "object",
                 "properties": {
@@ -109,7 +117,7 @@ def build_tool_registry(
                         "type": "string",
                         "minLength": 1,
                         "description": (
-                            "рабочая директория относительно workspace"
+                            'рабочая директория относительно workspace, для корня проекта укажи "."'
                         ),
                     },
                 },

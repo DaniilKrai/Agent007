@@ -92,11 +92,21 @@ class PlanningTest(unittest.TestCase):
 
     def execution_responses(self):
         return [
+            LLMResponse(None, (ToolCall("execution_read", "read_file", {"path": "order.py"}),)),
+            LLMResponse(None, (ToolCall("done_read", "complete_task", {
+                "task_id": "task_1", "evidence": ["execution_read"],
+            }),)),
             LLMResponse(None, (ToolCall("write", "write_file", {
                 "path": "order.py", "content": self.corrected,
             }),)),
+            LLMResponse(None, (ToolCall("done_write", "complete_task", {
+                "task_id": "task_2", "evidence": ["write"],
+            }),)),
             LLMResponse(None, (ToolCall("test", "Bash", {
                 "command": "python3 -m unittest -v", "cwd": ".",
+            }),)),
+            LLMResponse(None, (ToolCall("done_test", "complete_task", {
+                "task_id": "task_3", "evidence": ["test"],
             }),)),
             LLMResponse("тесты проходят"),
         ]
@@ -187,7 +197,7 @@ class PlanningTest(unittest.TestCase):
 
         self.assertEqual(result.status, "completed")
         self.assertTrue(engine._tests_verified(result.messages))
-        self.assertEqual(result.model_calls, 4)
+        self.assertEqual(result.model_calls, 8)
         self.assertEqual((self.workspace / "test_order.py").read_bytes(), tests)
         self.assertEqual(self.store.get_run(result.run_id)["phase"], "execution")
         self.assertEqual(self.store.get_decisions(result.run_id)[0]["action"], "approve_plan")

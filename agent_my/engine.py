@@ -12,6 +12,7 @@ from .runtime.executor import Executor
 from .runtime.store import RunStore, StoreError
 from .runtime.planning import PLANNING_PROMPT, PLAN_RETRY_MESSAGE, PLAN_SCHEMA
 from .runtime.budgets import BudgetLimits
+from .runtime.tasks import TASK_RETRY_MESSAGE, COMPLETE_TASK_SCHEMA
 from .tools.registry import ToolRegistry
 
 
@@ -102,6 +103,7 @@ class AgentEngine:
         mode: str = "auto",
         verify_tests: bool = False,
         budgets: BudgetLimits | None = None,
+        on_tasks_changed: Callable[[str], None] | None = None,
     ):
         if (
             not isinstance(max_steps, int)
@@ -126,6 +128,8 @@ class AgentEngine:
         self.mode = mode
         self.verify_tests = verify_tests
         self.budgets = budgets or BudgetLimits()
+        self.on_tasks_changed = on_tasks_changed
+        self._task_states = {}
 
         self.store = (
             store
@@ -360,6 +364,13 @@ class AgentEngine:
     ) -> AgentRunResult:
         while True:
             run = self.store.get_run(run_id)
+            self.store.prepare_tasks(run_id)
+            tasks = self.store.tasks.get_all(run_id)
+            task_state = [(task["task_id"], task["status"]) for task in tasks]
+            if task_state and self._task_states.get(run_id) != task_state:
+                self._task_states[run_id] = task_state
+                if self.on_tasks_changed is not None:
+                    self.on_tasks_changed(run_id)
 
             if run["status"] != "running":
                 return self._snapshot(run_id)
@@ -429,6 +440,19 @@ class AgentEngine:
                 )
 
                 validation_error = decision.error
+                if validation_error is None and run["phase"] == "execution":
+                    task_error = self.store.tasks.check_call(run_id, pending["task_id"], call.name)
+                    if task_error is None and call.name == "complete_task":
+                        if self.store.batch_size(run_id) != 1:
+                            task_error = "вызови complete_task отдельно от других инструментов"
+                        elif call.arguments["task_id"] != pending["task_id"]:
+                            task_error = "можно завершить только текущую задачу"
+                        else:
+                            task_error = self.store.tasks.completion_error(
+                                run_id, call.arguments["task_id"], call.arguments["evidence"],
+                            )
+                    if task_error is not None:
+                        validation_error = ToolResult(call.id, call.name, False, error=task_error)
                 if validation_error is None and call.name == "submit_plan" and self.store.batch_size(run_id) != 1:
                     validation_error = ToolResult(
                         call.id, call.name, False,
@@ -511,11 +535,35 @@ class AgentEngine:
                     else tool["function"]["name"] != "submit_plan"
                 )
             ]
+            planned_tasks = any(not task["implicit"] for task in tasks)
+            current_task = next((task for task in tasks if task["status"] == "running"), None)
+            if run["phase"] == "execution":
+                if planned_tasks:
+                    allowed = self.store.tasks.allowed_tools(run_id, current_task) if current_task else set()
+                    tools = [tool for tool in tools if tool["function"]["name"] in allowed]
+                else:
+                    tools = [tool for tool in tools if tool["function"]["name"] != "complete_task"]
             structured_plan = run["phase"] == "planning" and any(
                 message.get("role") == "system"
                 and message.get("content") == PLAN_RETRY_MESSAGE
                 for message in messages
             )
+            task_retry = TASK_RETRY_MESSAGE + "\nтекущая задача: " + current_task["task_id"] if current_task else None
+            structured_task = False
+            task_schema = None
+            if planned_tasks and current_task and any(
+                message.get("role") == "system" and message.get("content") == task_retry
+                for message in messages
+            ):
+                evidence = [
+                    call["call_id"] for call in self.store.tasks.calls(run_id, current_task["task_id"])
+                    if self.store.tasks.successful(call)
+                ]
+                if self.store.tasks.completion_error(run_id, current_task["task_id"], evidence) is None:
+                    structured_task = True
+                    task_schema = deepcopy(COMPLETE_TASK_SCHEMA)
+                    task_schema["properties"]["task_id"]["enum"] = [current_task["task_id"]]
+                    task_schema["properties"]["evidence"]["items"]["enum"] = evidence
             request_messages = deepcopy(messages)
             if run["phase"] == "execution":
                 request_messages[0]["content"] = request_messages[0]["content"].replace(
@@ -525,26 +573,58 @@ class AgentEngine:
                     message for message in request_messages
                     if not (
                         message.get("role") == "system"
-                        and message.get("content") == PLAN_RETRY_MESSAGE
+                        and (message.get("content") == PLAN_RETRY_MESSAGE
+                             or message.get("content", "").startswith(TASK_RETRY_MESSAGE))
                     )
                 ]
+                task_prompt = self.store.tasks.prompt(run_id)
+                if task_prompt:
+                    request_messages.append({"role": "system", "content": task_prompt})
+                if any(tool["function"]["name"] == "Bash" for tool in tools):
+                    policy = self.executor.policy
+                    bash_prompt = (
+                        "для Bash обязательны оба аргумента: command и cwd\n"
+                        'для тестов в корне проекта используй {"command": "python3 -m unittest -v", "cwd": "."}\n'
+                        "отправь эти аргументы настоящим вызовом Bash, а не текстом\n"
+                        "не добавляй имя файла теста или discover к команде\n"
+                        "команды Bash из policy: " + json.dumps(
+                            sorted(policy.commands_allow - policy.commands_deny), ensure_ascii=False,
+                        )
+                    )
+                    if planned_tasks:
+                        request_messages[-1]["content"] += "\n" + bash_prompt
+                    else:
+                        request_messages[0]["content"] += "\n" + bash_prompt
+                if structured_task:
+                    request_messages.append({"role": "system", "content": (
+                        "сейчас верни только JSON по заданной схеме с task_id и evidence\n"
+                        "выбери реальные подтверждения текущей задачи из перечисленных идентификаторов\n"
+                        "runtime проверит результаты и сам откроет следующую задачу\n"
+                        "не пиши код, пояснения или вызов инструмента текстом"
+                    )})
+                elif planned_tasks and not self.store.tasks.pending(run_id):
+                    request_messages.append({"role": "system", "content": (
+                        "все задачи подтверждены результатами инструментов\n"
+                        "сообщи пользователю краткий итог обычным текстом на русском со строчной буквы\n"
+                        "не повторяй JSON, служебные результаты или идентификаторы вызовов"
+                    )})
             response = self.llm.complete(
                 messages=request_messages,
-                tools=None if structured_plan else tools,
-                response_schema=PLAN_SCHEMA if structured_plan else None,
+                tools=None if structured_plan or structured_task else tools,
+                response_schema=PLAN_SCHEMA if structured_plan else task_schema,
                 tool_choice=(
                     "required"
-                    if messages[-1].get("role") == "system"
-                    and messages[-1].get("content") in (
+                    if (planned_tasks and current_task) or (messages[-1].get("role") == "system"
+                    and (messages[-1].get("content") in (
                         TOOL_CALL_RETRY_MESSAGE,
                         VERIFY_TESTS_RETRY_MESSAGE,
                         PLAN_RETRY_MESSAGE,
-                    )
+                    ) or messages[-1].get("content", "").startswith(TASK_RETRY_MESSAGE)))
                     else "auto"
                 ),
             )
 
-            if structured_plan and not response.tool_calls:
+            if (structured_plan or structured_task) and not response.tool_calls:
                 try:
                     plan = json.loads(response.content or "")
                 except (json.JSONDecodeError, RecursionError):
@@ -553,8 +633,8 @@ class AgentEngine:
                     response = LLMResponse(
                         content=response.content,
                         tool_calls=(ToolCall(
-                            id="plan_" + uuid.uuid4().hex,
-                            name="submit_plan",
+                            id=("plan_" if structured_plan else "task_") + uuid.uuid4().hex,
+                            name="submit_plan" if structured_plan else "complete_task",
                             arguments=plan if isinstance(plan, dict) else response.content,
                         ),),
                         finish_reason=response.finish_reason,
@@ -578,6 +658,16 @@ class AgentEngine:
                     retry_message = PLAN_RETRY_MESSAGE
                 else:
                     error = "модель не представила структурированный план, исполнение не начато"
+
+            elif not response.tool_calls and self.store.tasks.pending(run_id):
+                retries = sum(
+                    message.get("role") == "system" and message.get("content") == task_retry
+                    for message in messages
+                )
+                if retries < MAX_TOOL_CALL_RETRIES:
+                    retry_message = task_retry
+                else:
+                    error = "задача не завершена: нет подтверждённых результатов текущего шага"
 
             elif not response.tool_calls and verification_missing:
                 retries = sum(

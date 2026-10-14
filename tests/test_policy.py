@@ -195,6 +195,19 @@ class PolicyTest(unittest.TestCase):
 
         self.assertEqual(actual_path, expected_path)
 
+    def test_invalid_bash_arguments_explain_error_without_execution(self):
+        for arguments, expected in (
+            ({"command": "pwd"}, "отсутствует обязательный аргумент: cwd"),
+            ({"command": "pwd", "cwd": 1}, "неверный тип аргумента cwd: ожидается строка"),
+            ({"command": "pwd", "cwd": ".", "timeout": 5}, "неизвестные аргументы: timeout"),
+        ):
+            with self.subTest(arguments=arguments):
+                with patch.object(self.registry, "execute") as execute:
+                    result = self.executor.execute(ToolCall("bad", "Bash", arguments))
+                self.assertFalse(result.success)
+                self.assertIn(expected, result.error)
+                execute.assert_not_called()
+
     def test_denied_command(self):
         result = self.call(
             "Bash",

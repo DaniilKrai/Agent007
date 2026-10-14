@@ -10,6 +10,7 @@ from jsonschema import Draft202012Validator
 from agent_my.models import LLMResponse, ToolCall, ToolResult
 from .planning import PLAN_SCHEMA
 from .budgets import BudgetLimits, MIN_RESULT_BYTES, MAX_RESULT_BYTES, SIDE_EFFECT_TOOLS, limit_result, result_size
+from .tasks import TaskManager
 
 
 class StoreError(Exception):
@@ -32,6 +33,7 @@ class RunStore:
         )
 
         self.db.row_factory = sqlite3.Row
+        self.tasks = TaskManager(self.db)
 
         self.db.execute("PRAGMA foreign_keys = ON")
         self.db.execute("PRAGMA busy_timeout = 30000")
@@ -137,6 +139,13 @@ class RunStore:
             );
         """)
 
+        self.tasks.create_schema()
+        with self._transaction():
+            for table in ("tool_calls", "pending_calls"):
+                names = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+                if "task_id" not in names:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN task_id TEXT")
+
         columns = {
             row["name"]
             for row in self.db.execute(
@@ -216,7 +225,25 @@ class RunStore:
         self.get_run(run_id)
         return dict(self.db.execute("SELECT * FROM budgets WHERE run_id = ?", (run_id,)).fetchone())
 
+    def prepare_tasks(self, run_id: str):
+        with self._transaction():
+            run = self.get_run(run_id)
+            if run["phase"] != "execution" or run["status"] != "running":
+                return
+            pending = self.next_pending(run_id)
+            if pending is not None and not self.tasks.get_all(run_id):
+                self.tasks.ensure_implicit(run_id)
+                self.db.execute(
+                    "UPDATE pending_calls SET task_id = 'task_1' WHERE run_id = ? AND delivered = 0", (run_id,),
+                )
+                self.db.execute(
+                    "UPDATE tool_calls SET task_id = 'task_1' WHERE run_id = ? AND call_id IN "
+                    "(SELECT call_id FROM pending_calls WHERE run_id = ? AND delivered = 0)", (run_id, run_id),
+                )
+            self.tasks.current(run_id)
+
     def _budget_stop(self, run_id: str, label: str) -> None:
+        self.tasks.fail_current(run_id)
         self.db.execute(
             "UPDATE runs SET status = 'limit_reached', final_answer = ? WHERE run_id = ?",
             ("исчерпан бюджет " + label, run_id),
@@ -460,6 +487,13 @@ class RunStore:
                     )
                     return
 
+                if error is None and self.tasks.pending(run_id):
+                    raise StoreError("нельзя завершить запуск с незавершёнными задачами")
+                if error is not None:
+                    self.tasks.fail_current(run_id)
+                else:
+                    self.tasks.finish_implicit(run_id)
+
                 self.db.execute(
                     """
                     UPDATE runs
@@ -479,6 +513,14 @@ class RunStore:
             allowance = self._admit_batch(run_id, response.tool_calls)
             if allowance is None:
                 return
+
+            task_id = None
+            if run["phase"] == "execution":
+                if not self.tasks.get_all(run_id):
+                    self.tasks.ensure_implicit(run_id)
+                task = self.tasks.current(run_id)
+                if task is not None:
+                    task_id = task["task_id"]
 
             for position, call in enumerate(
                 response.tool_calls
@@ -504,21 +546,24 @@ class RunStore:
                             call_id,
                             name,
                             arguments,
-                            status
+                            status,
+                            task_id
                         )
-                        VALUES (?, ?, ?, ?, 'queued')
+                        VALUES (?, ?, ?, ?, 'queued', ?)
                         """,
                         (
                             run_id,
                             call.id,
                             call.name,
                             arguments,
+                            task_id,
                         ),
                     )
 
                 elif (
                     existing["name"] != call.name
                     or existing["arguments"] != arguments
+                    or existing["task_id"] != task_id
                 ):
                     error = ToolResult(
                         tool_call_id=call.id,
@@ -526,7 +571,7 @@ class RunStore:
                         success=False,
                         error=(
                             "ошибка протокола: повторный tool_call_id "
-                            "с другим именем или аргументами"
+                            "с другим именем, аргументами или задачей"
                         ),
                     )
 
@@ -541,9 +586,10 @@ class RunStore:
                         position,
                         call_id,
                         override_result,
-                        result_limit
+                        result_limit,
+                        task_id
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -551,6 +597,7 @@ class RunStore:
                         call.id,
                         override,
                         allowance,
+                        task_id,
                     ),
                 )
 
@@ -565,6 +612,7 @@ class RunStore:
                 p.call_id,
                 p.override_result,
                 p.result_limit,
+                p.task_id,
                 c.name,
                 c.arguments,
                 c.status,
@@ -589,6 +637,14 @@ class RunStore:
         call_id: str,
     ) -> None:
         with self._transaction():
+            run = self.get_run(run_id)
+            pending = self.next_pending(run_id)
+            if run["phase"] == "execution":
+                if pending is None or pending["call_id"] != call_id:
+                    raise StoreError("вызов не относится к текущей задаче")
+                error = self.tasks.check_call(run_id, pending["task_id"], pending["name"])
+                if error:
+                    raise StoreError(error)
             row = self.db.execute(
                 """
                 SELECT status, attempt_count
@@ -662,6 +718,7 @@ class RunStore:
                 (run_id, run["plan_call_id"], action + "_plan"),
             )
             if action == "approve":
+                self.tasks.create(run_id, json.loads(run["plan"])["steps"])
                 self.db.execute(
                     "UPDATE runs SET phase = 'execution', status = 'running' WHERE run_id = ?",
                     (run_id,),
@@ -687,6 +744,7 @@ class RunStore:
         executed: bool,
     ) -> ToolResult:
         plan = (result.data or {}).get("plan")
+        completed_task = result.data if result.name == "complete_task" and result.success else None
         with self._transaction():
             result = self._settle_result(run_id, position, result)
             encoded = self._json(asdict(result))
@@ -722,6 +780,9 @@ class RunStore:
                     raise StoreError(
                         "результат не соответствует выполняемому действию"
                     )
+
+                if completed_task is not None:
+                    self.tasks.finish(run_id, completed_task["task_id"], completed_task["evidence"])
 
                 if row["name"] == "submit_plan" and result.success:
                     run = self.get_run(run_id)
@@ -1185,6 +1246,7 @@ class RunStore:
                 "read_file",
                 "list_files",
                 "submit_plan",
+                "complete_task",
             ):
                 raise StoreError(
                     "повторение этого инструмента небезопасно"
@@ -1296,6 +1358,7 @@ class RunStore:
                 )
 
             else:
+                self.tasks.fail_current(run_id)
                 self.db.execute(
                     """
                     UPDATE runs
@@ -1307,6 +1370,7 @@ class RunStore:
 
     def mark_limit(self, run_id: str) -> None:
         with self._transaction():
+            self.tasks.fail_current(run_id)
             self.db.execute(
                 """
                 UPDATE runs

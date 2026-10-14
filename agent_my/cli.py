@@ -208,6 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     for command, help_text in (
+        ("tasks", "посмотреть задачи, зависимости и подтверждения"),
         ("plan", "посмотреть сохранённый план"),
         ("approve-plan", "утвердить план и начать исполнение"),
         ("reject-plan", "отклонить план без исполнения"),
@@ -376,6 +377,7 @@ def build_engine(
         verify_tests=verify_tests,
         budgets=budgets,
         on_tool_result=print_tool_result,
+        on_tasks_changed=lambda run_id: print_tasks(store, run_id),
     )
 
 def print_plan(plan: dict) -> None:
@@ -391,6 +393,23 @@ def print_plan(plan: dict) -> None:
     print("критерий готовности: " + format_model_text(plan["done_when"]))
 
 
+def print_tasks(store: RunStore, run_id: str, details: bool = False) -> None:
+    marks = {"pending": " ", "running": ">", "completed": "x", "failed": "!"}
+    for task in store.tasks.get_all(run_id):
+        print(f"[{marks[task['status']]}] {task['task_id']}: " + format_model_text(task["description"]))
+        if details:
+            print("    зависимости: " + (", ".join(task["dependencies"]) or "нет"))
+            print("    проверяемый результат: " + task["expected_result"])
+            print("    подтверждения: " + (", ".join(task["evidence"]) or "нет"))
+            for call in store.tasks.calls(run_id, task["task_id"]):
+                if call["call_id"] in task["evidence"]:
+                    result = json.loads(call["result"])
+                    detail = "успешно"
+                    if call["name"] == "Bash":
+                        detail += ", код завершения " + str(result["data"]["exit_code"])
+                    print(f"    {call['call_id']}: {call['name']}, {detail}")
+
+
 def print_run_result(
     engine: AgentEngine,
     result,
@@ -401,6 +420,7 @@ def print_run_result(
     print(f"вызовов инструментов: {result.tool_calls}")
     if engine is not None:
         print_budget(engine.store, result.run_id)
+        print_tasks(engine.store, result.run_id)
 
     if result.status == "waiting_plan":
         print_plan(engine.store.get_plan(result.run_id))
@@ -503,6 +523,7 @@ def print_run_result(
                 "read_file",
                 "list_files",
                 "submit_plan",
+                "complete_task",
             ):
                 print(
                     "доступные решения: retry, skip, abort"
@@ -611,6 +632,19 @@ def show_plan(run_id: str) -> int:
         store.close()
 
 
+def show_tasks(run_id: str) -> int:
+    store = RunStore(STATE_DB)
+    try:
+        store.get_run(run_id)
+        if store.tasks.get_all(run_id):
+            print_tasks(store, run_id, details=True)
+        else:
+            print("задачи ещё не созданы")
+        return 0
+    finally:
+        store.close()
+
+
 def decide_plan(run_id: str, approve: bool) -> int:
     engine = build_engine()
     result = engine.approve_plan(run_id) if approve else engine.reject_plan(run_id)
@@ -650,6 +684,7 @@ def show_status(run_id: str) -> int:
 
         print(f"режим выполнения: {run['mode']}")
         print_budget(store, run_id)
+        print_tasks(store, run_id)
         if run["status"] == "limit_reached":
             print(run["final_answer"] or "исчерпан бюджет запуска")
         print("фаза: " + ("планирование" if run["phase"] == "planning" else "исполнение"))
@@ -693,6 +728,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "plan":
             return show_plan(args.run_id)
+
+        if args.command == "tasks":
+            return show_tasks(args.run_id)
 
         if args.command == "approve-plan":
             return decide_plan(args.run_id, approve=True)

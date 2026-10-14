@@ -68,10 +68,12 @@ class Executor:
             definition["parameters"]
         )
 
-        if not validator.is_valid(call.arguments):
+        error = next(validator.iter_errors(call.arguments), None)
+        if error is not None:
             return self._error(
                 call,
-                "некорректные аргументы инструмента",
+                "некорректные аргументы инструмента: "
+                + self.registry.validation_message(error),
             )
 
         try:
@@ -93,7 +95,7 @@ class Executor:
                     path=call.arguments["path"],
                 )
 
-            elif call.name != "submit_plan":
+            elif call.name not in ("submit_plan", "complete_task"):
                 raise PermissionError(
                     f"инструмент не разрешён: {call.name}"
                 )
