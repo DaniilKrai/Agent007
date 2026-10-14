@@ -16,6 +16,7 @@ from .models import ToolCall, ToolResult
 from .runtime.executor import Executor
 from .runtime.policy import Policy
 from .runtime.store import RunStore, StoreError
+from .runtime.budgets import BudgetLimits
 from .tools import build_tool_registry
 
 
@@ -115,10 +116,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser.add_argument(
         "--max-steps",
+        "--max-model-calls",
         type=int,
         default=20,
         help="максимальное количество обращений к модели",
     )
+
+    for flag, default, help_text in (
+        ("--max-tool-calls", 100, "лимит допущенных вызовов инструментов, включая повторные попытки"),
+        ("--max-side-effects", 20, "лимит допущенных записей, удалений и команд Bash"),
+        ("--max-result-bytes", 1048576, "общий лимит результатов инструментов в байтах utf-8"),
+    ):
+        run_parser.add_argument(flag, type=int, default=default, help=help_text)
 
     run_parser.add_argument(
         "--mode",
@@ -306,9 +315,11 @@ def print_tool_result(
     call: ToolCall,
     result: ToolResult,
 ) -> None:
+    if result.truncated:
+        print(f"результат инструмента {call.name} неполный: достигнут лимит вывода")
     if not result.success:
         print(
-            f"инструмент {call.name}: ошибка — {result.error}"
+            f"инструмент {call.name}: ошибка — {result.error or 'результат обрезан'}"
         )
         return
 
@@ -332,6 +343,7 @@ def build_engine(
     max_steps: int = 20,
     mode: str = "safe",
     verify_tests: bool = True,
+    budgets: BudgetLimits | None = None,
 ) -> AgentEngine:
     settings = LLMSettings.from_env()
 
@@ -362,6 +374,7 @@ def build_engine(
         max_steps=max_steps,
         mode=mode,
         verify_tests=verify_tests,
+        budgets=budgets,
         on_tool_result=print_tool_result,
     )
 
@@ -386,6 +399,8 @@ def print_run_result(
     print(f"состояние запуска: {result.status}")
     print(f"обращений к модели: {result.model_calls}")
     print(f"вызовов инструментов: {result.tool_calls}")
+    if engine is not None:
+        print_budget(engine.store, result.run_id)
 
     if result.status == "waiting_plan":
         print_plan(engine.store.get_plan(result.run_id))
@@ -409,7 +424,7 @@ def print_run_result(
 
     if result.status == "limit_reached":
         print(
-            "достигнут лимит обращений к модели",
+            result.final_answer or "исчерпан бюджет запуска",
             file=sys.stderr,
         )
         return 2
@@ -515,6 +530,7 @@ def run_agent(args: argparse.Namespace) -> int:
         max_steps=args.max_steps,
         mode=args.mode,
         verify_tests=not args.no_verify_tests,
+        budgets=BudgetLimits(args.max_tool_calls, args.max_side_effects, args.max_result_bytes),
     )
 
     run_id = str(uuid.uuid4())
@@ -601,6 +617,22 @@ def decide_plan(run_id: str, approve: bool) -> int:
     return print_run_result(engine, result)
 
 
+def print_budget(store: RunStore, run_id: str) -> None:
+    run = store.get_run(run_id)
+    budget = store.get_budget(run_id)
+    print(f"бюджет модели: {run['model_calls']}/{run['max_steps']}")
+    for kind, label in (
+        ("tool_calls", "вызовов инструментов"),
+        ("side_effects", "действий с побочным эффектом"),
+        ("result_bytes", "результатов в байтах"),
+    ):
+        used = budget[kind + "_used"]
+        limit = budget[kind + "_limit"]
+        reserved = budget["result_bytes_reserved"] if kind == "result_bytes" else 0
+        print(f"бюджет {label}: {used}/{limit}, остаток: {limit - used - reserved}")
+    print(f"зарезервировано байт для ожидающих результатов: {budget['result_bytes_reserved']}")
+
+
 def show_status(run_id: str) -> int:
     store = RunStore(STATE_DB)
 
@@ -617,6 +649,9 @@ def show_status(run_id: str) -> int:
         )
 
         print(f"режим выполнения: {run['mode']}")
+        print_budget(store, run_id)
+        if run["status"] == "limit_reached":
+            print(run["final_answer"] or "исчерпан бюджет запуска")
         print("фаза: " + ("планирование" if run["phase"] == "planning" else "исполнение"))
 
         if run["status"] == "waiting_plan":

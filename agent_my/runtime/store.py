@@ -1,13 +1,15 @@
 import json
 import sqlite3
 
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from jsonschema import Draft202012Validator
 
-from agent_my.models import LLMResponse, ToolResult
+from agent_my.models import LLMResponse, ToolCall, ToolResult
 from .planning import PLAN_SCHEMA
+from .budgets import BudgetLimits, MIN_RESULT_BYTES, MAX_RESULT_BYTES, SIDE_EFFECT_TOOLS, limit_result, result_size
 
 
 class StoreError(Exception):
@@ -41,6 +43,15 @@ class RunStore:
 
         self._create_tables()
 
+    @contextmanager
+    def _transaction(self):
+        if self.db.in_transaction:
+            yield
+            return
+        self.db.execute("BEGIN IMMEDIATE")
+        with self.db:
+            yield
+
     def _create_tables(self) -> None:
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS runs (
@@ -51,6 +62,17 @@ class RunStore:
                 tool_calls INTEGER NOT NULL DEFAULT 0,
                 final_answer TEXT,
                 mode TEXT NOT NULL DEFAULT 'auto'
+            );
+
+            CREATE TABLE IF NOT EXISTS budgets (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                tool_calls_limit INTEGER NOT NULL,
+                side_effects_limit INTEGER NOT NULL,
+                result_bytes_limit INTEGER NOT NULL,
+                tool_calls_used INTEGER NOT NULL DEFAULT 0,
+                side_effects_used INTEGER NOT NULL DEFAULT 0,
+                result_bytes_used INTEGER NOT NULL DEFAULT 0,
+                result_bytes_reserved INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -123,7 +145,7 @@ class RunStore:
         }
 
         if "mode" not in columns:
-            with self.db:
+            with self._transaction():
                 self.db.execute(
                     """
                     ALTER TABLE runs
@@ -131,14 +153,144 @@ class RunStore:
                     """
                 )
 
-        with self.db:
+        with self._transaction():
             for name, definition in (
                 ("phase", "TEXT NOT NULL DEFAULT 'execution'"),
                 ("plan", "TEXT"),
                 ("plan_call_id", "TEXT"),
+                ("model_started", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+
+        with self._transaction():
+            pending_columns = {r["name"] for r in self.db.execute("PRAGMA table_info(pending_calls)")}
+            for name in ("result_limit", "result_charged"):
+                if name not in pending_columns:
+                    self.db.execute(f"ALTER TABLE pending_calls ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+            old_runs = self.db.execute(
+                "SELECT run_id FROM runs WHERE run_id NOT IN (SELECT run_id FROM budgets)"
+            ).fetchall()
+            for row in old_runs:
+                run_id = row["run_id"]
+                history = self.get_messages(run_id)
+                calls = [c for m in history for c in m.get("tool_calls", [])]
+                used_tools = max(len(calls), self.get_run(run_id)["tool_calls"])
+                used_effects = sum(c["function"]["name"] in SIDE_EFFECT_TOOLS for c in calls)
+                used_bytes = sum(len(m["content"].encode("utf-8")) for m in history if m["role"] == "tool")
+                defaults = BudgetLimits()
+                self._create_budget(run_id, BudgetLimits(
+                    max(defaults.tool_calls, used_tools),
+                    max(defaults.side_effects, used_effects),
+                    max(defaults.result_bytes, used_bytes),
+                ))
+                self.db.execute(
+                    "UPDATE budgets SET tool_calls_used = ?, side_effects_used = ?, result_bytes_used = ? WHERE run_id = ?",
+                    (used_tools, used_effects, used_bytes, run_id),
+                )
+                pending = self.db.execute(
+                    "SELECT position FROM pending_calls WHERE run_id = ? AND delivered = 0", (run_id,),
+                ).fetchall()
+                if pending:
+                    available = max(defaults.result_bytes, used_bytes) - used_bytes
+                    allowance = min(MAX_RESULT_BYTES, available // len(pending))
+                    if allowance < MIN_RESULT_BYTES:
+                        self._budget_stop(run_id, "результатов инструментов")
+                    else:
+                        self.db.execute(
+                            "UPDATE pending_calls SET result_limit = ? WHERE run_id = ? AND delivered = 0",
+                            (allowance, run_id),
+                        )
+                        self.db.execute(
+                            "UPDATE budgets SET result_bytes_reserved = ? WHERE run_id = ?",
+                            (allowance * len(pending), run_id),
+                        )
+
+    def _create_budget(self, run_id: str, limits: BudgetLimits) -> None:
+        self.db.execute(
+            "INSERT INTO budgets (run_id, tool_calls_limit, side_effects_limit, result_bytes_limit) VALUES (?, ?, ?, ?)",
+            (run_id, limits.tool_calls, limits.side_effects, limits.result_bytes),
+        )
+
+    def get_budget(self, run_id: str) -> dict:
+        self.get_run(run_id)
+        return dict(self.db.execute("SELECT * FROM budgets WHERE run_id = ?", (run_id,)).fetchone())
+
+    def _budget_stop(self, run_id: str, label: str) -> None:
+        self.db.execute(
+            "UPDATE runs SET status = 'limit_reached', final_answer = ? WHERE run_id = ?",
+            ("исчерпан бюджет " + label, run_id),
+        )
+
+    def begin_model_request(self, run_id: str) -> bool:
+        with self._transaction():
+            run = self.get_run(run_id)
+            if run["status"] != "running" or self.next_pending(run_id) is not None:
+                raise StoreError("нельзя начать запрос к модели в текущем состоянии")
+            if run["model_calls"] >= run["max_steps"]:
+                self._budget_stop(run_id, "обращений к модели")
+                return False
+            self.db.execute(
+                "UPDATE runs SET model_calls = model_calls + 1, model_started = 1 WHERE run_id = ?", (run_id,),
+            )
+            return True
+
+    def _admit_batch(self, run_id: str, calls: Sequence[ToolCall]) -> int | None:
+        budget = self.get_budget(run_id)
+        count = len(calls)
+        effects = sum(call.name in SIDE_EFFECT_TOOLS for call in calls)
+        for kind, needed, label in (
+            ("tool_calls", count, "вызовов инструментов"),
+            ("side_effects", effects, "действий с побочным эффектом"),
+        ):
+            if budget[kind + "_used"] + needed > budget[kind + "_limit"]:
+                self._budget_stop(run_id, label)
+                return None
+        available = budget["result_bytes_limit"] - budget["result_bytes_used"] - budget["result_bytes_reserved"]
+        allowance = min(MAX_RESULT_BYTES, available // count)
+        if allowance < MIN_RESULT_BYTES:
+            self._budget_stop(run_id, "результатов инструментов")
+            return None
+        self.db.execute(
+            "UPDATE budgets SET tool_calls_used = tool_calls_used + ?, side_effects_used = side_effects_used + ?, "
+            "result_bytes_reserved = result_bytes_reserved + ? WHERE run_id = ?",
+            (count, effects, allowance * count, run_id),
+        )
+        return allowance
+
+    def _settle_result(self, run_id: str, position: int, result: ToolResult) -> ToolResult:
+        pending = self.db.execute(
+            "SELECT * FROM pending_calls WHERE run_id = ? AND position = ?", (run_id, position),
+        ).fetchone()
+        if pending is None or pending["delivered"]:
+            raise StoreError("результат уже сохранён или вызов не найден")
+        limited = limit_result(result, pending["result_limit"])
+        if not pending["result_charged"]:
+            self.db.execute(
+                "UPDATE budgets SET result_bytes_reserved = result_bytes_reserved - ?, "
+                "result_bytes_used = result_bytes_used + ? WHERE run_id = ?",
+                (pending["result_limit"], result_size(limited), run_id),
+            )
+            self.db.execute(
+                "UPDATE pending_calls SET result_charged = 1 WHERE run_id = ? AND position = ?", (run_id, position),
+            )
+        return limited
+
+    def _charge_uncertain_result(self, run_id: str, call_id: str) -> None:
+        pending = self.db.execute(
+            "SELECT position, result_limit FROM pending_calls WHERE run_id = ? AND call_id = ? "
+            "AND delivered = 0 AND result_charged = 0", (run_id, call_id),
+        ).fetchall()
+        for row in pending:
+            self.db.execute(
+                "UPDATE budgets SET result_bytes_reserved = result_bytes_reserved - ?, "
+                "result_bytes_used = result_bytes_used + ? WHERE run_id = ?",
+                (row["result_limit"], row["result_limit"], run_id),
+            )
+            self.db.execute(
+                "UPDATE pending_calls SET result_charged = 1 WHERE run_id = ? AND position = ?",
+                (run_id, row["position"]),
+            )
 
     @staticmethod
     def _json(value: Any) -> str:
@@ -169,6 +321,7 @@ class RunStore:
         max_steps: int,
         mode: str = "auto",
         phase: str = "execution",
+        budgets: BudgetLimits | None = None,
     ) -> None:
         if mode not in ("safe", "auto"):
             raise StoreError(
@@ -178,7 +331,7 @@ class RunStore:
         if phase not in ("planning", "execution"):
             raise StoreError("неизвестная фаза запуска")
 
-        with self.db:
+        with self._transaction():
             self.db.execute(
                 """
                 INSERT INTO runs (
@@ -188,6 +341,8 @@ class RunStore:
                 """,
                 (run_id, max_steps, mode, phase),
             )
+
+            self._create_budget(run_id, budgets or BudgetLimits())
 
             self._append_message(
                 run_id,
@@ -256,7 +411,7 @@ class RunStore:
         ):
             raise StoreError("некорректное решение по ответу модели")
 
-        with self.db:
+        with self._transaction():
             run = self.get_run(run_id)
 
             if run["status"] != "running":
@@ -293,14 +448,9 @@ class RunStore:
                 response.to_assistant_message(),
             )
 
-            self.db.execute(
-                """
-                UPDATE runs
-                SET model_calls = model_calls + 1
-                WHERE run_id = ?
-                """,
-                (run_id,),
-            )
+            if not run["model_started"]:
+                raise StoreError("запрос к модели не был списан из бюджета")
+            self.db.execute("UPDATE runs SET model_started = 0 WHERE run_id = ?", (run_id,))
 
             if not response.tool_calls:
                 if retry_message is not None:
@@ -324,6 +474,10 @@ class RunStore:
                     ),
                 )
 
+                return
+
+            allowance = self._admit_batch(run_id, response.tool_calls)
+            if allowance is None:
                 return
 
             for position, call in enumerate(
@@ -386,15 +540,17 @@ class RunStore:
                         run_id,
                         position,
                         call_id,
-                        override_result
+                        override_result,
+                        result_limit
                     )
-                    VALUES (?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
                         position,
                         call.id,
                         override,
+                        allowance,
                     ),
                 )
 
@@ -408,6 +564,7 @@ class RunStore:
                 p.position,
                 p.call_id,
                 p.override_result,
+                p.result_limit,
                 c.name,
                 c.arguments,
                 c.status,
@@ -431,7 +588,7 @@ class RunStore:
         run_id: str,
         call_id: str,
     ) -> None:
-        with self.db:
+        with self._transaction():
             row = self.db.execute(
                 """
                 SELECT status, attempt_count
@@ -493,7 +650,7 @@ class RunStore:
         if action not in ("approve", "reject"):
             raise StoreError("неизвестное решение по плану")
 
-        with self.db:
+        with self._transaction():
             run = self.get_run(run_id)
             if run["status"] != "waiting_plan" or run["phase"] != "planning":
                 raise StoreError("запуск не ожидает утверждения плана")
@@ -528,10 +685,11 @@ class RunStore:
         position: int,
         result: ToolResult,
         executed: bool,
-    ) -> None:
-        encoded = self._json(asdict(result))
-
-        with self.db:
+    ) -> ToolResult:
+        plan = (result.data or {}).get("plan")
+        with self._transaction():
+            result = self._settle_result(run_id, position, result)
+            encoded = self._json(asdict(result))
             pending = self.db.execute(
                 """
                 SELECT call_id, delivered
@@ -566,7 +724,6 @@ class RunStore:
                     )
 
                 if row["name"] == "submit_plan" and result.success:
-                    plan = (result.data or {}).get("plan")
                     run = self.get_run(run_id)
                     if (
                         run["phase"] != "planning"
@@ -624,15 +781,17 @@ class RunStore:
                 result.to_message(),
             )
 
+        return result
+
     def complete_without_execution(
         self,
         run_id: str,
         position: int,
         result: ToolResult,
-    ) -> None:
-        encoded = self._json(asdict(result))
-
-        with self.db:
+    ) -> ToolResult:
+        with self._transaction():
+            result = self._settle_result(run_id, position, result)
+            encoded = self._json(asdict(result))
             pending = self.next_pending(run_id)
 
             if (
@@ -683,6 +842,8 @@ class RunStore:
                 result.to_message(),
             )
 
+        return result
+
     def get_approval(
         self,
         run_id: str,
@@ -727,7 +888,7 @@ class RunStore:
         run_id: str,
         call_id: str,
     ) -> None:
-        with self.db:
+        with self._transaction():
             run = self.get_run(run_id)
 
             if run["status"] != "running":
@@ -788,7 +949,7 @@ class RunStore:
                 "неизвестное решение пользователя"
             )
 
-        with self.db:
+        with self._transaction():
             run = self.get_run(run_id)
 
             if run["status"] != "waiting_approval":
@@ -863,9 +1024,8 @@ class RunStore:
                     ),
                 )
 
-                encoded = self._json(
-                    asdict(result)
-                )
+                result = self._settle_result(run_id, pending["position"], result)
+                encoded = self._json(asdict(result))
 
                 self.db.execute(
                     """
@@ -923,7 +1083,7 @@ class RunStore:
         self,
         run_id: str,
     ) -> bool:
-        with self.db:
+        with self._transaction():
             rows = self.db.execute(
                 """
                 SELECT call_id, attempt_count
@@ -935,6 +1095,7 @@ class RunStore:
             ).fetchall()
 
             for row in rows:
+                self._charge_uncertain_result(run_id, row["call_id"])
                 self.db.execute(
                     """
                     UPDATE tool_calls
@@ -1003,7 +1164,7 @@ class RunStore:
                 "неизвестное решение пользователя"
             )
 
-        with self.db:
+        with self._transaction():
             run = self.get_run(run_id)
 
             if run["status"] != "waiting_resolution":
@@ -1042,6 +1203,14 @@ class RunStore:
             )
 
             if action == "retry":
+                allowance = self._admit_batch(run_id, [ToolCall(call_id, call["name"], {})])
+                if allowance is None:
+                    return
+                self.db.execute(
+                    "UPDATE pending_calls SET result_limit = ?, result_charged = 0 "
+                    "WHERE run_id = ? AND call_id = ? AND delivered = 0",
+                    (allowance, run_id, call_id),
+                )
                 self.db.execute(
                     """
                     UPDATE tool_calls
@@ -1071,9 +1240,9 @@ class RunStore:
                     ),
                 )
 
-                encoded = self._json(
-                    asdict(result)
-                )
+                pending_result = self.next_pending(run_id)
+                result = self._settle_result(run_id, pending_result["position"], result)
+                encoded = self._json(asdict(result))
 
                 self.db.execute(
                     """
@@ -1137,7 +1306,7 @@ class RunStore:
                 )
 
     def mark_limit(self, run_id: str) -> None:
-        with self.db:
+        with self._transaction():
             self.db.execute(
                 """
                 UPDATE runs

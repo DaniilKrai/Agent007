@@ -11,6 +11,7 @@ from .models import LLMResponse, ToolCall, ToolResult
 from .runtime.executor import Executor
 from .runtime.store import RunStore, StoreError
 from .runtime.planning import PLANNING_PROMPT, PLAN_RETRY_MESSAGE, PLAN_SCHEMA
+from .runtime.budgets import BudgetLimits
 from .tools.registry import ToolRegistry
 
 
@@ -100,6 +101,7 @@ class AgentEngine:
         ] | None = None,
         mode: str = "auto",
         verify_tests: bool = False,
+        budgets: BudgetLimits | None = None,
     ):
         if (
             not isinstance(max_steps, int)
@@ -123,6 +125,7 @@ class AgentEngine:
         self.after_tool_execution = after_tool_execution
         self.mode = mode
         self.verify_tests = verify_tests
+        self.budgets = budgets or BudgetLimits()
 
         self.store = (
             store
@@ -153,9 +156,12 @@ class AgentEngine:
         mode: str,
         approved: bool,
         phase: str,
+        result_limit: int,
     ) -> ToolResult:
         try:
-            return self.executor.execute(call, mode=mode, approved=approved, phase=phase)
+            return self.executor.execute(
+                call, mode=mode, approved=approved, phase=phase, result_limit=result_limit,
+            )
 
         except Exception:
             return ToolResult(
@@ -226,6 +232,7 @@ class AgentEngine:
                         and data.get("exit_code") == 0
                         and not data.get("timed_out")
                         and not data.get("truncated")
+                        and not result.get("truncated")
                     )
 
         return verified
@@ -257,6 +264,7 @@ class AgentEngine:
             max_steps=self.max_steps,
             mode=self.mode,
             phase="planning" if plan else "execution",
+            budgets=self.budgets,
         )
 
         return self._drive(run_id)
@@ -376,7 +384,7 @@ class AgentEngine:
 
                     result = ToolResult(**data)
 
-                    self.store.deliver_result(
+                    result = self.store.deliver_result(
                         run_id,
                         position,
                         result,
@@ -428,7 +436,7 @@ class AgentEngine:
                     )
 
                 if validation_error is not None:
-                    self.store.complete_without_execution(
+                    validation_error = self.store.complete_without_execution(
                         run_id,
                         position,
                         validation_error,
@@ -466,7 +474,9 @@ class AgentEngine:
                     call.id,
                 )
 
-                result = self._execute_tool(call, run["mode"], approved, run["phase"])
+                result = self._execute_tool(
+                    call, run["mode"], approved, run["phase"], pending["result_limit"],
+                )
 
                 if self.after_tool_execution is not None:
                     self.after_tool_execution(
@@ -474,7 +484,7 @@ class AgentEngine:
                         result,
                     )
 
-                self.store.deliver_result(
+                result = self.store.deliver_result(
                     run_id,
                     position,
                     result,
@@ -489,8 +499,7 @@ class AgentEngine:
 
                 continue
 
-            if run["model_calls"] >= run["max_steps"]:
-                self.store.mark_limit(run_id)
+            if not self.store.begin_model_request(run_id):
                 return self._snapshot(run_id)
 
             messages = self.store.get_messages(run_id)

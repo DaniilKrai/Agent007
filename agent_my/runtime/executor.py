@@ -150,6 +150,7 @@ class Executor:
         mode: str = "safe",
         approved: bool = False,
         phase: str = "execution",
+        result_limit: int | None = None,
     ) -> ToolResult:
         decision = self.check(call, mode, approved, phase)
 
@@ -159,4 +160,4 @@ class Executor:
         if decision.requires_approval:
             return self._error(call, "для выполнения инструмента требуется подтверждение")
 
-        return self.registry.execute(call)
+        return self.registry.execute(call, result_limit=result_limit)

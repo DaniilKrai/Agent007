@@ -129,14 +129,14 @@ class RecoveryTest(unittest.TestCase):
             engine.run("измени файл", run_id="text_retry")
 
         self.assertEqual(self.store.get_run("text_retry")["status"], "running")
-        self.assertEqual(self.store.get_run("text_retry")["model_calls"], 1)
+        self.assertEqual(self.store.get_run("text_retry")["model_calls"], 2)
         self.restart_store()
         fake, engine = self.make_engine([response, response])
 
         result = engine.resume("text_retry")
 
         self.assertEqual(result.status, "failed")
-        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(result.model_calls, 4)
         self.assertEqual(result.tool_calls, 0)
         self.assertEqual(len(fake.calls), 2)
         self.assertEqual(fake.calls[0]["messages"][-1]["role"], "system")
@@ -170,7 +170,7 @@ class RecoveryTest(unittest.TestCase):
         result = engine.resume("text_retry_success")
 
         self.assertEqual(result.status, "completed")
-        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(result.model_calls, 4)
         self.assertEqual(result.tool_calls, 1)
         self.assertIn("value = 1", fake.calls[1]["messages"][-1]["content"])
 
@@ -187,7 +187,7 @@ class RecoveryTest(unittest.TestCase):
         result = engine.resume("verify_tests")
 
         self.assertEqual(result.status, "failed")
-        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(result.model_calls, 4)
         self.assertEqual(fake.calls[0]["tool_choice"], "required")
 
     def test_completed_run_is_persisted(self):
@@ -277,7 +277,7 @@ class RecoveryTest(unittest.TestCase):
 
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.tool_calls, 1)
-        self.assertEqual(result.model_calls, 2)
+        self.assertEqual(result.model_calls, 3)
 
         tool_messages = [
             item
@@ -668,6 +668,7 @@ class RecoveryTest(unittest.TestCase):
             ToolCall("bad", "write_file", '{"path":"order.py",'),
         ))
         self.store.create_run("bad_arguments", "измени файл", "агент", 20, mode="auto")
+        self.store.begin_model_request("bad_arguments")
         self.store.record_response("bad_arguments", response)
         self.restart_store()
         fake, engine = self.make_engine([
@@ -841,6 +842,7 @@ class RecoveryTest(unittest.TestCase):
             max_steps=10,
         )
 
+        self.store.begin_model_request("test_queued")
         self.store.record_response(
             "test_queued",
             self.make_call(

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path, PureWindowsPath
 
 
@@ -40,13 +41,15 @@ class FileTools:
 
         return resolved
 
-    def list_files(self, path: str) -> dict:
+    def list_files(self, path: str, result_limit: int | None = None) -> dict:
         target = self._resolve(path)
 
         if not target.is_dir():
             raise NotADirectoryError(f"не является директорией: {path}")
 
         items = []
+        used = 0
+        truncated = False
 
         for item in sorted(target.iterdir(), key=lambda p: p.name):
             if item.is_symlink():
@@ -56,31 +59,46 @@ class FileTools:
             else:
                 item_type = "file"
 
-            items.append({
+            entry = {
                 "name": item.name,
                 "path": item.relative_to(self.root).as_posix(),
                 "type": item_type,
-            })
+            }
+            size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+            if result_limit is not None and used + size > result_limit:
+                truncated = True
+                break
+            items.append(entry)
+            used += size
 
         return {
             "path": target.relative_to(self.root).as_posix(),
             "items": items,
+            **({"truncated": True} if truncated else {}),
         }
 
-    def read_file(self, path: str) -> dict:
+    def read_file(self, path: str, result_limit: int | None = None) -> dict:
         target = self._resolve(path)
 
         if not target.is_file():
             raise FileNotFoundError(f"файл не найден: {path}")
 
-        content = target.read_text(encoding="utf-8")
+        truncated = False
+        if result_limit is None:
+            content = target.read_text(encoding="utf-8")
+        else:
+            with target.open("rb") as file:
+                raw = file.read(result_limit + 1)
+            truncated = len(raw) > result_limit
+            content = raw[:result_limit].decode("utf-8", errors="ignore" if truncated else "strict")
 
         return {
             "path": target.relative_to(self.root).as_posix(),
             "content": content,
+            **({"truncated": True} if truncated else {}),
         }
 
-    def write_file(self, path: str, content: str) -> dict:
+    def write_file(self, path: str, content: str, result_limit: int | None = None) -> dict:
         target = self._resolve(path)
 
         if not target.parent.is_dir():
@@ -102,7 +120,7 @@ class FileTools:
             "bytes_written": len(content.encode("utf-8")),
         }
 
-    def delete_file(self, path: str) -> dict:
+    def delete_file(self, path: str, result_limit: int | None = None) -> dict:
         target = self._resolve(path)
 
         if not target.is_file():

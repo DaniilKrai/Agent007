@@ -120,7 +120,7 @@ class ToolRegistry:
 
         return "аргументы не соответствуют схеме"
 
-    def execute(self, call: ToolCall) -> ToolResult:
+    def execute(self, call: ToolCall, result_limit: int | None = None) -> ToolResult:
         tool = self._tools.get(call.name)
 
         if tool is None:
@@ -145,13 +145,17 @@ class ToolRegistry:
             )
 
         try:
-            data = tool.handler(**call.arguments)
+            arguments = dict(call.arguments)
+            if result_limit is not None:
+                arguments["result_limit"] = result_limit
+            data = tool.handler(**arguments)
 
             return ToolResult(
                 tool_call_id=call.id,
                 name=call.name,
                 success=True,
                 data=data,
+                truncated=bool(data.get("truncated")),
             )
 
         except (

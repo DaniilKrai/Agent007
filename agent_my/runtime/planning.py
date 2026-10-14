@@ -54,5 +54,5 @@ PLAN_RETRY_MESSAGE = (
 )
 
 
-def submit_plan(**plan) -> dict:
+def submit_plan(result_limit: int | None = None, **plan) -> dict:
     return {"plan": plan}

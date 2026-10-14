@@ -48,9 +48,12 @@ class BashTool:
             except ProcessLookupError:
                 pass
 
-    def run(self, command: str, cwd: str) -> dict:
+    def run(self, command: str, cwd: str, result_limit: int | None = None) -> dict:
         self.policy.reload()
         directory = self.policy.check_bash(command, cwd)
+        output_limit = self.max_output_bytes
+        if result_limit is not None:
+            output_limit = min(output_limit, result_limit)
 
         environment = os.environ.copy()
         environment.pop("BASH_ENV", None)
@@ -125,7 +128,7 @@ class BashTool:
                             continue
 
                         available = (
-                            self.max_output_bytes - total_bytes
+                            output_limit - total_bytes
                         )
 
                         if len(chunk) > available:

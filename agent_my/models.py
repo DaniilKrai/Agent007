@@ -17,6 +17,7 @@ class ToolResult:
     success: bool
     data: dict[str, Any] | None = None
     error: str | None = None
+    truncated: bool = False
 
     def to_message(self) -> dict[str, str]:
         if self.success:
@@ -29,6 +30,11 @@ class ToolResult:
                 "success": False,
                 "error": self.error,
             }
+
+        if self.truncated:
+            content["truncated"] = True
+            if self.data is not None:
+                content["data"] = self.data
 
         return {
             "role": "tool",

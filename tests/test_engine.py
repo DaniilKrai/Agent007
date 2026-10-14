@@ -691,7 +691,7 @@ class AgentEngineTest(unittest.TestCase):
             "limit_reached",
         )
 
-        self.assertIsNone(result.final_answer)
+        self.assertIn("бюджет обращений к модели", result.final_answer)
         self.assertEqual(result.model_calls, 1)
         self.assertEqual(result.tool_calls, 1)
         self.assertEqual(len(fake.calls), 1)
