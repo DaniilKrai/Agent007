@@ -1,10 +1,17 @@
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .filesystem import FileTools
 from .registry import ToolRegistry
 
+if TYPE_CHECKING:
+    from agent_my.runtime.policy import Policy
 
-def build_tool_registry(workspace_root: Path) -> ToolRegistry:
+
+def build_tool_registry(
+    workspace_root: Path,
+    policy: "Policy | None" = None,
+) -> ToolRegistry:
     files = FileTools(workspace_root)
     registry = ToolRegistry()
 
@@ -73,5 +80,35 @@ def build_tool_registry(workspace_root: Path) -> ToolRegistry:
         },
         handler=files.delete_file,
     )
+
+    if policy is not None:
+        from .bash import BashTool
+
+        bash = BashTool(policy)
+
+        registry.register(
+            name="Bash",
+            description="выполнить разрешённую команду через bash",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "команда bash",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "рабочая директория относительно workspace"
+                        ),
+                    },
+                },
+                "required": ["command", "cwd"],
+                "additionalProperties": False,
+            },
+            handler=bash.run,
+        )
 
     return registry

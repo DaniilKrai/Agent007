@@ -1,0 +1,24 @@
+{
+  "commands": {
+    "allow": [
+      "pwd",
+      "python3 -m unittest -v"
+    ],
+    "deny": [
+      "rm -rf ."
+    ]
+  },
+  "directories": {
+    "allow": [
+      "."
+    ],
+    "deny": [
+      "private"
+    ]
+  },
+  "files": {
+    "deny": [
+      "test_order.py"
+    ]
+  }
+}
