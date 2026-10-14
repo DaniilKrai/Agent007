@@ -133,6 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="разрешить текстовое завершение без проверки тестов для задач анализа",
     )
 
+    run_parser.add_argument(
+        "--plan", action="store_true",
+        help="изучить проект и предложить план до выполнения изменений",
+    )
+
     resume_parser = subparsers.add_parser(
         "resume",
         help="продолжить сохранённый запуск",
@@ -192,6 +197,14 @@ def build_parser() -> argparse.ArgumentParser:
         "run_id",
         type=str,
     )
+
+    for command, help_text in (
+        ("plan", "посмотреть сохранённый план"),
+        ("approve-plan", "утвердить план и начать исполнение"),
+        ("reject-plan", "отклонить план без исполнения"),
+    ):
+        plan_parser = subparsers.add_parser(command, help=help_text, add_help=False)
+        plan_parser.add_argument("run_id", type=str)
 
     return parser
 
@@ -352,6 +365,19 @@ def build_engine(
         on_tool_result=print_tool_result,
     )
 
+def print_plan(plan: dict) -> None:
+    print("цель: " + format_model_text(plan["goal"]))
+    print("шаги:")
+    for number, step in enumerate(plan["steps"], 1):
+        print(f"{number}) " + format_model_text(step["description"]))
+        print("   инструменты: " + ", ".join(step["tools"]))
+    for key, label in (("risks", "риски"), ("assumptions", "допущения")):
+        print(label + ": " + (
+            "; ".join(format_model_text(item) for item in plan[key]) or "не указаны"
+        ))
+    print("критерий готовности: " + format_model_text(plan["done_when"]))
+
+
 def print_run_result(
     engine: AgentEngine,
     result,
@@ -360,6 +386,17 @@ def print_run_result(
     print(f"состояние запуска: {result.status}")
     print(f"обращений к модели: {result.model_calls}")
     print(f"вызовов инструментов: {result.tool_calls}")
+
+    if result.status == "waiting_plan":
+        print_plan(engine.store.get_plan(result.run_id))
+        print("агент ожидает утверждения плана")
+        print(f"для утверждения: python -m agent_my approve-plan {result.run_id}")
+        print(f"для отказа: python -m agent_my reject-plan {result.run_id}")
+        return 3
+
+    if result.status == "plan_rejected":
+        print("план отклонён, исполнение не начато")
+        return 0
 
     if result.status == "completed":
         print(
@@ -450,6 +487,7 @@ def print_run_result(
             if call["name"] in (
                 "read_file",
                 "list_files",
+                "submit_plan",
             ):
                 print(
                     "доступные решения: retry, skip, abort"
@@ -487,6 +525,7 @@ def run_agent(args: argparse.Namespace) -> int:
     result = engine.run(
         args.prompt,
         run_id=run_id,
+        plan=args.plan,
     )
 
     return print_run_result(
@@ -544,6 +583,24 @@ def reject_action(run_id: str) -> int:
     )
 
 
+def show_plan(run_id: str) -> int:
+    store = RunStore(STATE_DB)
+    try:
+        plan = store.get_plan(run_id)
+        if plan is None:
+            raise StoreError("для этого запуска ещё нет сохранённого плана")
+        print_plan(plan)
+        return 0
+    finally:
+        store.close()
+
+
+def decide_plan(run_id: str, approve: bool) -> int:
+    engine = build_engine()
+    result = engine.approve_plan(run_id) if approve else engine.reject_plan(run_id)
+    return print_run_result(engine, result)
+
+
 def show_status(run_id: str) -> int:
     store = RunStore(STATE_DB)
 
@@ -560,6 +617,11 @@ def show_status(run_id: str) -> int:
         )
 
         print(f"режим выполнения: {run['mode']}")
+        print("фаза: " + ("планирование" if run["phase"] == "planning" else "исполнение"))
+
+        if run["status"] == "waiting_plan":
+            print("агент ожидает утверждения плана")
+            print(f"для просмотра: python -m agent_my plan {run_id}")
 
         if run["status"] == "waiting_approval":
             approval = store.get_pending_approval(run_id)
@@ -593,6 +655,15 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "run":
             return run_agent(args)
+
+        if args.command == "plan":
+            return show_plan(args.run_id)
+
+        if args.command == "approve-plan":
+            return decide_plan(args.run_id, approve=True)
+
+        if args.command == "reject-plan":
+            return decide_plan(args.run_id, approve=False)
 
         if args.command == "resume":
             return resume_agent(args.run_id)

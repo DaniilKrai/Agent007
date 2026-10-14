@@ -135,6 +135,21 @@ class OpenAICompatibleClientTest(unittest.TestCase):
             "required",
         )
 
+    def test_structured_response_uses_json_schema_without_tools(self):
+        schema = {"type": "object", "properties": {"goal": {"type": "string"}}}
+        self.sdk.chat.completions.create.return_value = make_sdk_response(content='{"goal":"проверить"}')
+
+        response = self.client.complete(self.messages, response_schema=schema)
+
+        kwargs = self.sdk.chat.completions.create.call_args.kwargs
+        self.assertEqual(kwargs["response_format"], {
+            "type": "json_schema",
+            "json_schema": {"name": "plan", "strict": True, "schema": schema},
+        })
+        self.assertNotIn("tools", kwargs)
+        self.assertNotIn("tool_choice", kwargs)
+        self.assertEqual(json.loads(response.content), {"goal": "проверить"})
+
     def test_multiple_tool_calls(self):
         calls = [
             make_sdk_call(
@@ -173,11 +188,14 @@ class OpenAICompatibleClientTest(unittest.TestCase):
             make_sdk_response(tool_calls=[call])
         )
 
-        with self.assertRaisesRegex(
-            LLMError,
-            "некорректный json",
-        ):
-            self.client.complete(self.messages)
+        response = self.client.complete(self.messages)
+
+        self.assertEqual(response.tool_calls[0].arguments, "{invalid")
+        self.assertEqual(response.tool_calls[0].id, "call_1")
+        self.assertEqual(
+            response.to_assistant_message()["tool_calls"][0]["function"]["arguments"],
+            "{invalid",
+        )
 
     def test_arguments_must_be_object(self):
         call = make_sdk_call(
@@ -190,11 +208,46 @@ class OpenAICompatibleClientTest(unittest.TestCase):
             make_sdk_response(tool_calls=[call])
         )
 
-        with self.assertRaisesRegex(
-            LLMError,
-            "должны быть объектом",
-        ):
-            self.client.complete(self.messages)
+        response = self.client.complete(self.messages)
+
+        self.assertEqual(response.tool_calls[0].arguments, '["order.py"]')
+
+    def test_non_object_arguments_preserve_original_json(self):
+        for raw in ('null', '42', 'true', '"text"', '[]', None, ["order.py"]):
+            with self.subTest(raw=raw):
+                self.sdk.chat.completions.create.return_value = make_sdk_response(
+                    tool_calls=[make_sdk_call("bad", "read_file", raw)],
+                )
+
+                response = self.client.complete(self.messages)
+
+                expected = raw if isinstance(raw, str) else json.dumps(raw)
+                self.assertEqual(response.tool_calls[0].arguments, expected)
+                self.assertEqual(
+                    response.to_assistant_message()["tool_calls"][0]["function"]["arguments"],
+                    expected,
+                )
+
+    def test_invalid_history_is_prepared_without_changing_saved_arguments(self):
+        for raw in ('{invalid', '[]', 'null', '"text"'):
+            with self.subTest(raw=raw):
+                history = [
+                    *self.messages,
+                    LLMResponse(content=None, tool_calls=(
+                        ToolCall("bad", "read_file", raw),
+                    )).to_assistant_message(),
+                    {"role": "tool", "tool_call_id": "bad", "content": '{"success":false}'},
+                ]
+                self.sdk.chat.completions.create.return_value = make_sdk_response(content="готово")
+
+                self.client.complete(history)
+
+                sent = self.sdk.chat.completions.create.call_args.kwargs["messages"]
+                self.assertEqual(sent[1]["tool_calls"][0]["function"]["arguments"], "{}")
+                self.assertIn(raw, sent[1]["content"])
+                self.assertEqual(sent[2]["tool_call_id"], "bad")
+                self.assertEqual(history[1]["tool_calls"][0]["function"]["arguments"], raw)
+                self.assertIsNone(history[1]["content"])
 
     def test_empty_response(self):
         self.sdk.chat.completions.create.return_value = (

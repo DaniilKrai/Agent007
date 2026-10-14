@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .llm import LLMClient
-from .models import ToolCall, ToolResult
+from .models import LLMResponse, ToolCall, ToolResult
 from .runtime.executor import Executor
 from .runtime.store import RunStore, StoreError
+from .runtime.planning import PLANNING_PROMPT, PLAN_RETRY_MESSAGE, PLAN_SCHEMA
 from .tools.registry import ToolRegistry
 
 
@@ -149,9 +150,12 @@ class AgentEngine:
     def _execute_tool(
         self,
         call: ToolCall,
+        mode: str,
+        approved: bool,
+        phase: str,
     ) -> ToolResult:
         try:
-            return self.executor.execute(call)
+            return self.executor.execute(call, mode=mode, approved=approved, phase=phase)
 
         except Exception:
             return ToolResult(
@@ -226,26 +230,11 @@ class AgentEngine:
 
         return verified
 
-    @staticmethod
-    def _requires_approval(
-        mode: str,
-        tool_name: str,
-    ) -> bool:
-        if tool_name == "delete_file":
-            return True
-
-        if mode == "safe":
-            return tool_name in (
-                "write_file",
-                "Bash",
-            )
-
-        return False
-
     def run(
         self,
         prompt: str,
         run_id: str | None = None,
+        plan: bool = False,
     ) -> AgentRunResult:
         if not isinstance(prompt, str) or not prompt.strip():
             raise AgentError(
@@ -255,15 +244,19 @@ class AgentEngine:
         if run_id is None:
             run_id = str(uuid.uuid4())
 
+        system_prompt = SYSTEM_PROMPT
+        if self.verify_tests:
+            system_prompt += "\n" + VERIFY_TESTS_PROMPT
+        if plan:
+            system_prompt += "\n" + PLANNING_PROMPT
+
         self.store.create_run(
             run_id=run_id,
             prompt=prompt,
-            system_prompt=(
-                SYSTEM_PROMPT + "\n" + VERIFY_TESTS_PROMPT
-                if self.verify_tests else SYSTEM_PROMPT
-            ),
+            system_prompt=system_prompt,
             max_steps=self.max_steps,
             mode=self.mode,
+            phase="planning" if plan else "execution",
         )
 
         return self._drive(run_id)
@@ -288,6 +281,14 @@ class AgentEngine:
             return self._snapshot(run_id)
 
         return self._drive(run_id)
+
+    def approve_plan(self, run_id: str) -> AgentRunResult:
+        self.store.decide_plan(run_id, "approve")
+        return self._drive(run_id)
+
+    def reject_plan(self, run_id: str) -> AgentRunResult:
+        self.store.decide_plan(run_id, "reject")
+        return self._snapshot(run_id)
 
     def approve(
         self,
@@ -413,9 +414,18 @@ class AgentEngine:
                         "неизвестное состояние вызова инструмента"
                     )
 
-                validation_error = self.executor.validate(
-                    call
+                approval = self.store.get_approval(run_id, call.id)
+                approved = approval == "approved"
+                decision = self.executor.check(
+                    call, mode=run["mode"], approved=approved, phase=run["phase"],
                 )
+
+                validation_error = decision.error
+                if validation_error is None and call.name == "submit_plan" and self.store.batch_size(run_id) != 1:
+                    validation_error = ToolResult(
+                        call.id, call.name, False,
+                        error="отправь план отдельным вызовом submit_plan, без других инструментов в ответе",
+                    )
 
                 if validation_error is not None:
                     self.store.complete_without_execution(
@@ -432,15 +442,7 @@ class AgentEngine:
 
                     continue
 
-                if self._requires_approval(
-                    run["mode"],
-                    call.name,
-                ):
-                    approval = self.store.get_approval(
-                        run_id,
-                        call.id,
-                    )
-
+                if decision.requires_approval:
                     if approval is None:
                         self.store.request_approval(
                             run_id,
@@ -464,7 +466,7 @@ class AgentEngine:
                     call.id,
                 )
 
-                result = self._execute_tool(call)
+                result = self._execute_tool(call, run["mode"], approved, run["phase"])
 
                 if self.after_tool_execution is not None:
                     self.after_tool_execution(
@@ -492,28 +494,83 @@ class AgentEngine:
                 return self._snapshot(run_id)
 
             messages = self.store.get_messages(run_id)
+            tools = [
+                tool for tool in self.registry.openai_tools()
+                if (
+                    tool["function"]["name"] in ("list_files", "read_file", "submit_plan")
+                    if run["phase"] == "planning"
+                    else tool["function"]["name"] != "submit_plan"
+                )
+            ]
+            structured_plan = run["phase"] == "planning" and any(
+                message.get("role") == "system"
+                and message.get("content") == PLAN_RETRY_MESSAGE
+                for message in messages
+            )
+            request_messages = deepcopy(messages)
+            if run["phase"] == "execution":
+                request_messages[0]["content"] = request_messages[0]["content"].replace(
+                    "\n" + PLANNING_PROMPT, "",
+                )
+                request_messages = [
+                    message for message in request_messages
+                    if not (
+                        message.get("role") == "system"
+                        and message.get("content") == PLAN_RETRY_MESSAGE
+                    )
+                ]
             response = self.llm.complete(
-                messages=messages,
-                tools=self.registry.openai_tools(),
+                messages=request_messages,
+                tools=None if structured_plan else tools,
+                response_schema=PLAN_SCHEMA if structured_plan else None,
                 tool_choice=(
                     "required"
                     if messages[-1].get("role") == "system"
                     and messages[-1].get("content") in (
                         TOOL_CALL_RETRY_MESSAGE,
                         VERIFY_TESTS_RETRY_MESSAGE,
+                        PLAN_RETRY_MESSAGE,
                     )
                     else "auto"
                 ),
             )
 
+            if structured_plan and not response.tool_calls:
+                try:
+                    plan = json.loads(response.content or "")
+                except (json.JSONDecodeError, RecursionError):
+                    pass
+                else:
+                    response = LLMResponse(
+                        content=response.content,
+                        tool_calls=(ToolCall(
+                            id="plan_" + uuid.uuid4().hex,
+                            name="submit_plan",
+                            arguments=plan if isinstance(plan, dict) else response.content,
+                        ),),
+                        finish_reason=response.finish_reason,
+                    )
+
             retry_message = None
             error = None
             verification_missing = (
-                VERIFY_TESTS_PROMPT in messages[0]["content"]
+                run["phase"] == "execution"
+                and VERIFY_TESTS_PROMPT in messages[0]["content"]
                 and not self._tests_verified(messages)
             )
 
-            if not response.tool_calls and verification_missing:
+            if not response.tool_calls and run["phase"] == "planning":
+                retries = sum(
+                    message.get("role") == "system"
+                    and message.get("content") == PLAN_RETRY_MESSAGE
+                    for message in messages
+                )
+                if retries < MAX_TOOL_CALL_RETRIES:
+                    retry_message = PLAN_RETRY_MESSAGE
+                else:
+                    error = "модель не представила структурированный план, исполнение не начато"
+
+            elif not response.tool_calls and verification_missing:
                 retries = sum(
                     message.get("role") == "system"
                     and message.get("content") == VERIFY_TESTS_RETRY_MESSAGE

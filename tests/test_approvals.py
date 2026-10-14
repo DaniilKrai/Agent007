@@ -124,6 +124,46 @@ class ApprovalTest(unittest.TestCase):
         self.store.close()
         self.store = RunStore(self.db_path)
 
+    def test_policy_changed_before_approval_after_restart(self):
+        fake, engine = self.make_engine([
+            self.tool_response("write", "write_file", path="order.py", content="changed"),
+        ])
+        result = engine.run("измени файл")
+        self.assertEqual(result.status, "waiting_approval")
+        self.restart_store()
+        config = json.loads(self.policy_path.read_text())
+        config["files"]["deny"].append("order.py")
+        self.policy_path.write_text(json.dumps(config), encoding="utf-8")
+        fake, engine = self.make_engine([LLMResponse(content="действие запрещено")])
+
+        with patch.object(self.registry, "execute") as execute:
+            result = engine.approve(result.run_id)
+
+        self.assertEqual(result.status, "completed")
+        execute.assert_not_called()
+        self.assertEqual((self.workspace / "order.py").read_text(), "value = 1\n")
+        message = fake.calls[0]["messages"][-1]
+        self.assertEqual(message["tool_call_id"], "write")
+        self.assertIn("запрещено", json.loads(message["content"])["error"])
+
+    def test_symlink_created_before_approval(self):
+        fake, engine = self.make_engine([
+            self.tool_response("write", "write_file", path="order.py", content="changed"),
+            LLMResponse(content="действие запрещено"),
+        ])
+        result = engine.run("измени файл")
+        outside = self.root / "outside.py"
+        outside.write_text("unchanged", encoding="utf-8")
+        target = self.workspace / "order.py"
+        target.unlink()
+        target.symlink_to(outside)
+
+        result = engine.approve(result.run_id)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(outside.read_text(), "unchanged")
+        self.assertIn("символьных ссылок", fake.calls[1]["messages"][-1]["content"])
+
     def test_safe_write_requires_approval(self):
         fake, engine = self.make_engine([
             self.tool_response(

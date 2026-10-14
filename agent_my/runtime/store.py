@@ -4,8 +4,10 @@ import sqlite3
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from jsonschema import Draft202012Validator
 
 from agent_my.models import LLMResponse, ToolResult
+from .planning import PLAN_SCHEMA
 
 
 class StoreError(Exception):
@@ -129,6 +131,15 @@ class RunStore:
                     """
                 )
 
+        with self.db:
+            for name, definition in (
+                ("phase", "TEXT NOT NULL DEFAULT 'execution'"),
+                ("plan", "TEXT"),
+                ("plan_call_id", "TEXT"),
+            ):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+
     @staticmethod
     def _json(value: Any) -> str:
         return json.dumps(
@@ -157,21 +168,25 @@ class RunStore:
         system_prompt: str,
         max_steps: int,
         mode: str = "auto",
+        phase: str = "execution",
     ) -> None:
         if mode not in ("safe", "auto"):
             raise StoreError(
                 "неизвестный режим выполнения"
             )
 
+        if phase not in ("planning", "execution"):
+            raise StoreError("неизвестная фаза запуска")
+
         with self.db:
             self.db.execute(
                 """
                 INSERT INTO runs (
-                    run_id, status, max_steps, mode
+                    run_id, status, max_steps, mode, phase
                 )
-                VALUES (?, 'running', ?, ?)
+                VALUES (?, 'running', ?, ?, ?)
                 """,
-                (run_id, max_steps, mode),
+                (run_id, max_steps, mode, phase),
             )
 
             self._append_message(
@@ -465,6 +480,48 @@ class RunStore:
                 (run_id,),
             )
 
+    def batch_size(self, run_id: str) -> int:
+        return self.db.execute(
+            "SELECT COUNT(*) FROM pending_calls WHERE run_id = ?", (run_id,),
+        ).fetchone()[0]
+
+    def get_plan(self, run_id: str) -> dict | None:
+        plan = self.get_run(run_id)["plan"]
+        return json.loads(plan) if plan is not None else None
+
+    def decide_plan(self, run_id: str, action: str) -> None:
+        if action not in ("approve", "reject"):
+            raise StoreError("неизвестное решение по плану")
+
+        with self.db:
+            run = self.get_run(run_id)
+            if run["status"] != "waiting_plan" or run["phase"] != "planning":
+                raise StoreError("запуск не ожидает утверждения плана")
+            if run["plan"] is None or run["plan_call_id"] is None:
+                raise StoreError("сохранённый план не найден")
+
+            self.db.execute(
+                "INSERT INTO decisions (run_id, call_id, action) VALUES (?, ?, ?)",
+                (run_id, run["plan_call_id"], action + "_plan"),
+            )
+            if action == "approve":
+                self.db.execute(
+                    "UPDATE runs SET phase = 'execution', status = 'running' WHERE run_id = ?",
+                    (run_id,),
+                )
+                message = (
+                    "пользователь утвердил план, режим планирования завершён\n"
+                    "теперь выполняй утверждённый план, изменяй файлы и проверяй результат через Bash\n"
+                    "утверждение плана не отменяет policy и подтверждения отдельных действий"
+                )
+            else:
+                self.db.execute(
+                    "UPDATE runs SET status = 'plan_rejected' WHERE run_id = ?", (run_id,),
+                )
+                message = "пользователь отклонил план, исполнение не начато"
+
+            self._append_message(run_id, {"role": "system", "content": message})
+
     def deliver_result(
         self,
         run_id: str,
@@ -496,7 +553,7 @@ class RunStore:
             if executed:
                 row = self.db.execute(
                     """
-                    SELECT status, attempt_count
+                    SELECT status, attempt_count, name
                     FROM tool_calls
                     WHERE run_id = ? AND call_id = ?
                     """,
@@ -506,6 +563,20 @@ class RunStore:
                 if row is None or row["status"] != "started":
                     raise StoreError(
                         "результат не соответствует выполняемому действию"
+                    )
+
+                if row["name"] == "submit_plan" and result.success:
+                    plan = (result.data or {}).get("plan")
+                    run = self.get_run(run_id)
+                    if (
+                        run["phase"] != "planning"
+                        or self.batch_size(run_id) != 1
+                        or not Draft202012Validator(PLAN_SCHEMA).is_valid(plan)
+                    ):
+                        raise StoreError("нельзя сохранить план в текущем состоянии")
+                    self.db.execute(
+                        "UPDATE runs SET plan = ?, plan_call_id = ?, status = 'waiting_plan' WHERE run_id = ?",
+                        (self._json(plan), result.tool_call_id, run_id),
                     )
 
                 self.db.execute(
@@ -952,6 +1023,7 @@ class RunStore:
             if action == "retry" and call["name"] not in (
                 "read_file",
                 "list_files",
+                "submit_plan",
             ):
                 raise StoreError(
                     "повторение этого инструмента небезопасно"

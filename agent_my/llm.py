@@ -25,6 +25,7 @@ class LLMClient(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str = "auto",
+        response_schema: dict[str, Any] | None = None,
     ) -> LLMResponse:
         ...
 
@@ -46,23 +47,58 @@ class OpenAICompatibleClient:
                 max_retries=0,
             )
 
+    @staticmethod
+    def _prepare_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        prepared = deepcopy(messages)
+
+        for message in prepared:
+            if message.get("role") != "assistant":
+                continue
+
+            for call in message.get("tool_calls", []):
+                function = call["function"]
+                raw = function.get("arguments")
+                try:
+                    arguments = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, RecursionError):
+                    arguments = None
+
+                if isinstance(arguments, dict):
+                    continue
+
+                function["arguments"] = "{}"
+                original = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                details = f"некорректные аргументы вызова {call['id']}: {original}"
+                message["content"] = "\n".join(
+                    part for part in (message.get("content"), details) if part
+                )
+
+        return prepared
+
     def complete(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str = "auto",
+        response_schema: dict[str, Any] | None = None,
     ) -> LLMResponse:
         if not messages:
             raise LLMError("нельзя отправить пустую историю сообщений")
 
         request: dict[str, Any] = {
             "model": self.settings.model,
-            "messages": messages,
+            "messages": self._prepare_messages(messages),
         }
 
         if tools:
             request["tools"] = tools
             request["tool_choice"] = tool_choice
+
+        if response_schema is not None:
+            request["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "plan", "strict": True, "schema": response_schema},
+            }
 
         try:
             response = self._client.chat.completions.create(
@@ -144,20 +180,19 @@ class OpenAICompatibleClient:
             elif isinstance(raw_arguments, str):
                 try:
                     arguments = json.loads(raw_arguments)
-                except json.JSONDecodeError as exc:
-                    raise LLMError(
-                        "модель вернула некорректный json аргументов инструмента"
-                    ) from exc
+                except (json.JSONDecodeError, RecursionError):
+                    arguments = raw_arguments
+
+                if not isinstance(arguments, dict):
+                    arguments = raw_arguments
 
             else:
-                raise LLMError(
-                    "модель вернула аргументы в неподдерживаемом формате"
-                )
-
-            if not isinstance(arguments, dict):
-                raise LLMError(
-                    "аргументы инструмента должны быть объектом"
-                )
+                try:
+                    arguments = json.dumps(raw_arguments, ensure_ascii=False)
+                except (TypeError, ValueError, RecursionError) as exc:
+                    raise LLMError(
+                        "модель вернула аргументы в неподдерживаемом формате"
+                    ) from exc
 
             calls.append(
                 ToolCall(
@@ -186,11 +221,13 @@ class FakeLLM:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str = "auto",
+        response_schema: dict[str, Any] | None = None,
     ) -> LLMResponse:
         self.calls.append({
             "messages": deepcopy(messages),
             "tools": deepcopy(tools),
             "tool_choice": tool_choice,
+            "response_schema": deepcopy(response_schema),
         })
 
         if not self._responses:

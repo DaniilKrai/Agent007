@@ -3,13 +3,15 @@ import tempfile
 import unittest
 
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+from agent_my.config import LLMSettings
 from agent_my.engine import (
     AgentEngine,
     AgentError,
 )
-from agent_my.llm import FakeLLM
+from agent_my.llm import FakeLLM, OpenAICompatibleClient
 from agent_my.models import LLMResponse, ToolCall
 from agent_my.runtime.executor import Executor
 from agent_my.runtime.policy import Policy
@@ -129,6 +131,54 @@ class AgentEngineTest(unittest.TestCase):
         )
 
         return fake, engine
+
+    def test_invalid_json_is_returned_to_model_and_corrected(self):
+        def sdk_response(calls=(), content=None):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=content, tool_calls=[
+                    SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(
+                        name=name, arguments=arguments,
+                    ))
+                    for call_id, name, arguments in calls
+                ]),
+                finish_reason="tool_calls" if calls else "stop",
+            )])
+
+        sdk = Mock()
+        sdk.chat.completions.create.side_effect = [
+            sdk_response([
+                ("bad", "write_file", '{"path":"order.py",'),
+                ("read", "read_file", '{"path":"order.py"}'),
+            ]),
+            sdk_response([("fixed", "write_file", json.dumps({
+                "path": "order.py", "content": self.corrected_code,
+            }))]),
+            sdk_response(content="файл исправлен"),
+        ]
+        _, engine = self.make_engine([])
+        engine.mode = "safe"
+        engine.llm = OpenAICompatibleClient(
+            LLMSettings("http://localhost:11434/v1/", "ollama", "qwen3:4b"),
+            sdk_client=sdk,
+        )
+
+        result = engine.run("исправь файл")
+
+        self.assertEqual(result.status, "waiting_approval")
+        self.assertEqual((self.workspace / "order.py").read_text(), self.original_code)
+        messages = sdk.chat.completions.create.call_args_list[1].kwargs["messages"]
+        self.assertEqual(messages[-2]["role"], "tool")
+        self.assertEqual(messages[-2]["tool_call_id"], "bad")
+        self.assertIn("некорректный json", messages[-2]["content"])
+        self.assertEqual(messages[-1]["tool_call_id"], "read")
+        self.assertTrue(json.loads(messages[-1]["content"])["success"])
+
+        result = engine.approve(result.run_id)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual((self.workspace / "order.py").read_text(), self.corrected_code)
+        self.assertEqual(len([call for call, result in self.events if call.name == "write_file" and result.success]), 1)
 
     def test_complete_task(self):
         responses = [

@@ -81,6 +81,14 @@ class Policy:
                 "не указаны разрешённые директории"
             )
 
+    def reload(self) -> None:
+        updated = Policy(self.policy_path, self.root)
+        self.commands_allow = updated.commands_allow
+        self.commands_deny = updated.commands_deny
+        self.directories_allow = updated.directories_allow
+        self.directories_deny = updated.directories_deny
+        self.files_deny = updated.files_deny
+
     @staticmethod
     def _read_list(data: dict, key: str, group: str) -> list[str]:
         values = data.get(key, [])

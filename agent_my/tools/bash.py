@@ -49,6 +49,7 @@ class BashTool:
                 pass
 
     def run(self, command: str, cwd: str) -> dict:
+        self.policy.reload()
         directory = self.policy.check_bash(command, cwd)
 
         environment = os.environ.copy()

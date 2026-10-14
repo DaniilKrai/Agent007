@@ -3,6 +3,7 @@ import tempfile
 import unittest
 
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_my.models import ToolCall
 from agent_my.runtime.executor import Executor
@@ -89,8 +90,86 @@ class PolicyTest(unittest.TestCase):
                 id="call_test",
                 name=name,
                 arguments=arguments,
-            )
+            ),
+            mode="auto",
         )
+
+    def test_executor_requires_approval_without_agent_loop(self):
+        for mode, name, arguments in (
+            ("safe", "write_file", {"path": "order.py", "content": "changed"}),
+            ("safe", "Bash", {"command": "pwd", "cwd": "."}),
+            ("safe", "delete_file", {"path": "order.py"}),
+            ("auto", "delete_file", {"path": "order.py"}),
+        ):
+            with self.subTest(mode=mode, name=name):
+                with patch.object(self.registry, "execute") as execute:
+                    result = self.executor.execute(ToolCall("call", name, arguments), mode=mode)
+
+                self.assertFalse(result.success)
+                self.assertIn("требуется подтверждение", result.error)
+                execute.assert_not_called()
+
+        self.assertEqual((self.workspace / "order.py").read_text(), "value = 1\n")
+
+    def test_executor_defaults_to_safe(self):
+        result = self.executor.execute(ToolCall("call", "write_file", {
+            "path": "order.py", "content": "changed",
+        }))
+
+        self.assertFalse(result.success)
+        self.assertIn("подтверждение", result.error)
+        self.assertEqual((self.workspace / "order.py").read_text(), "value = 1\n")
+
+    def test_executor_rejects_unknown_mode(self):
+        with patch.object(self.registry, "execute") as execute:
+            result = self.executor.execute(
+                ToolCall("call", "read_file", {"path": "order.py"}),
+                mode="unknown", approved=True,
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn("неизвестный режим", result.error)
+        execute.assert_not_called()
+
+    def test_executor_checks_policy_again_before_execution(self):
+        call = ToolCall("write", "write_file", {"path": "order.py", "content": "changed"})
+        self.assertIsNone(self.executor.check(call, "safe", approved=True).error)
+        self.config["files"]["deny"].append("order.py")
+        self.policy_path.write_text(json.dumps(self.config), encoding="utf-8")
+
+        with patch.object(self.registry, "execute") as execute:
+            result = self.executor.execute(call, mode="safe", approved=True)
+
+        self.assertFalse(result.success)
+        self.assertIn("запрещено", result.error)
+        execute.assert_not_called()
+        self.assertEqual((self.workspace / "order.py").read_text(), "value = 1\n")
+
+    def test_invalid_policy_blocks_execution(self):
+        self.policy_path.write_text("{invalid", encoding="utf-8")
+
+        with patch.object(self.registry, "execute") as execute:
+            result = self.executor.execute(
+                ToolCall("write", "write_file", {"path": "order.py", "content": "changed"}),
+                mode="auto",
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn("некорректный json", result.error)
+        execute.assert_not_called()
+
+    def test_non_object_arguments_return_tool_error(self):
+        for arguments in ('null', '[]', '"text"', 'true', '42', '{}'):
+            with self.subTest(arguments=arguments):
+                with patch.object(self.registry, "execute") as execute:
+                    result = self.executor.execute(
+                        ToolCall("bad", "write_file", arguments), mode="auto",
+                    )
+
+                self.assertFalse(result.success)
+                self.assertEqual(result.tool_call_id, "bad")
+                self.assertIn("должны быть объектом", result.error)
+                execute.assert_not_called()
 
     def test_bash_registered(self):
         names = {

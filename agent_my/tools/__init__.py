@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 
 from .filesystem import FileTools
 from .registry import ToolRegistry
+from agent_my.runtime.planning import PLAN_SCHEMA, submit_plan
 
 if TYPE_CHECKING:
     from agent_my.runtime.policy import Policy
@@ -14,6 +15,13 @@ def build_tool_registry(
 ) -> ToolRegistry:
     files = FileTools(workspace_root)
     registry = ToolRegistry()
+
+    registry.register(
+        name="submit_plan",
+        description="сохранить план с целью, шагами, инструментами, рисками, допущениями и критерием готовности для утверждения пользователем",
+        parameters=PLAN_SCHEMA,
+        handler=submit_plan,
+    )
 
     path_schema = {
         "type": "string",

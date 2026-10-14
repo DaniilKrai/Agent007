@@ -1,9 +1,18 @@
+import json
+
+from dataclasses import dataclass
 from jsonschema import Draft202012Validator
 
 from agent_my.models import ToolCall, ToolResult
 from agent_my.tools.registry import ToolRegistry
 
 from .policy import Policy
+
+
+@dataclass(frozen=True)
+class ExecutionDecision:
+    error: ToolResult | None = None
+    requires_approval: bool = False
 
 
 class Executor:
@@ -31,6 +40,17 @@ class Executor:
         self,
         call: ToolCall,
     ) -> ToolResult | None:
+        if not isinstance(call.name, str) or not call.name:
+            return self._error(call, "некорректное имя инструмента")
+
+        if isinstance(call.arguments, str):
+            try:
+                json.loads(call.arguments)
+            except (json.JSONDecodeError, RecursionError):
+                return self._error(call, "некорректный json аргументов инструмента")
+
+            return self._error(call, "аргументы инструмента должны быть объектом")
+
         definitions = {
             item["function"]["name"]: item["function"]
             for item in self.registry.openai_tools()
@@ -55,6 +75,7 @@ class Executor:
             )
 
         try:
+            self.policy.reload()
             if call.name == "Bash":
                 self.policy.check_bash(
                     command=call.arguments["command"],
@@ -72,25 +93,70 @@ class Executor:
                     path=call.arguments["path"],
                 )
 
-            else:
+            elif call.name != "submit_plan":
                 raise PermissionError(
                     f"инструмент не разрешён: {call.name}"
                 )
 
         except (
-            PermissionError,
+            OSError,
             ValueError,
-            FileNotFoundError,
-            NotADirectoryError,
+            RuntimeError,
         ) as exc:
             return self._error(call, str(exc))
 
         return None
 
-    def execute(self, call: ToolCall) -> ToolResult:
+    def check(
+        self,
+        call: ToolCall,
+        mode: str,
+        approved: bool = False,
+        phase: str = "execution",
+    ) -> ExecutionDecision:
+        if mode not in ("safe", "auto"):
+            return ExecutionDecision(
+                error=self._error(call, "неизвестный режим выполнения"),
+            )
+
+        if phase not in ("planning", "execution"):
+            return ExecutionDecision(error=self._error(call, "неизвестная фаза запуска"))
+
         error = self.validate(call)
 
         if error is not None:
-            return error
+            return ExecutionDecision(error=error)
+
+        if phase == "planning" and call.name not in ("list_files", "read_file", "submit_plan"):
+            return ExecutionDecision(error=self._error(
+                call, "до утверждения плана разрешены только чтение файлов и отправка плана",
+            ))
+
+        if phase == "execution" and call.name == "submit_plan":
+            return ExecutionDecision(error=self._error(call, "запуск не находится в режиме планирования"))
+
+        requires_approval = (
+            call.name == "delete_file"
+            or mode == "safe" and call.name in ("write_file", "Bash")
+        )
+
+        return ExecutionDecision(
+            requires_approval=requires_approval and approved is not True,
+        )
+
+    def execute(
+        self,
+        call: ToolCall,
+        mode: str = "safe",
+        approved: bool = False,
+        phase: str = "execution",
+    ) -> ToolResult:
+        decision = self.check(call, mode, approved, phase)
+
+        if decision.error is not None:
+            return decision.error
+
+        if decision.requires_approval:
+            return self._error(call, "для выполнения инструмента требуется подтверждение")
 
         return self.registry.execute(call)

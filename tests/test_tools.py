@@ -50,6 +50,7 @@ class ToolRegistryTest(unittest.TestCase):
                 "read_file",
                 "write_file",
                 "delete_file",
+                "submit_plan",
             },
         )
 

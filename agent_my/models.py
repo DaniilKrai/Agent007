@@ -8,7 +8,7 @@ from typing import Any
 class ToolCall:
     id: str
     name: str
-    arguments: dict[str, Any]
+    arguments: dict[str, Any] | str
 
 @dataclass(frozen=True)
 class ToolResult:
@@ -55,9 +55,10 @@ class LLMResponse:
                     "type": "function",
                     "function": {
                         "name": call.name,
-                        "arguments": json.dumps(
-                            call.arguments,
-                            ensure_ascii=False,
+                        "arguments": (
+                            call.arguments
+                            if isinstance(call.arguments, str)
+                            else json.dumps(call.arguments, ensure_ascii=False)
                         ),
                     },
                 }

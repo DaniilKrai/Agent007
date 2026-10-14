@@ -649,6 +649,44 @@ class RecoveryTest(unittest.TestCase):
             content["error"],
         )
 
+    def test_repeated_id_with_other_name(self):
+        fake, engine = self.make_engine([
+            self.make_call("same", "read_file", path="order.py"),
+            self.make_call("same", "delete_file", path="order.py"),
+            LLMResponse(content="готово"),
+        ])
+
+        result = engine.run("прочитай файл")
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.tool_calls, 1)
+        self.assertEqual((self.workspace / "order.py").read_text(), "value = 1\n")
+        self.assertIn("ошибка протокола", fake.calls[-1]["messages"][-1]["content"])
+
+    def test_invalid_arguments_survive_restart(self):
+        response = LLMResponse(content=None, tool_calls=(
+            ToolCall("bad", "write_file", '{"path":"order.py",'),
+        ))
+        self.store.create_run("bad_arguments", "измени файл", "агент", 20, mode="auto")
+        self.store.record_response("bad_arguments", response)
+        self.restart_store()
+        fake, engine = self.make_engine([
+            self.make_call("fixed", "write_file", path="order.py", content="value = 2\n"),
+            LLMResponse(content="готово"),
+        ])
+
+        result = engine.resume("bad_arguments")
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual((self.workspace / "order.py").read_text(), "value = 2\n")
+        self.assertEqual(fake.calls[0]["messages"][-1]["tool_call_id"], "bad")
+        self.assertIn("некорректный json", fake.calls[0]["messages"][-1]["content"])
+        self.assertEqual(self.store.get_attempts("bad_arguments", "bad"), [])
+        self.assertEqual(
+            json.loads(self.store.get_tool_call("bad_arguments", "bad")["arguments"]),
+            '{"path":"order.py",',
+        )
+
     def test_batch_recovery(self):
         responses = [
             LLMResponse(
