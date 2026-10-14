@@ -1,3 +1,4 @@
+import ast
 import json
 import uuid
 
@@ -22,23 +23,51 @@ SYSTEM_PROMPT = """
 - исключение составляют названия файлов, переменных, функций и программный код
 - начинай сообщения со строчной буквы
 - не ставь точку в конце сообщения
-- пример правильного ответа: функция calculate_total вычисляет итоговую стоимость заказа с учётом скидки
 
 правила работы:
 - самостоятельно изучай файлы, находи ошибки, исправляй код и проверяй результат
 - для взаимодействия с проектом используй предоставленные инструменты
 - не придумывай содержимое файлов, сначала прочитай их
+- перед исправлением прочитай и исходный файл, и относящиеся к нему тесты
+- исправляй все случаи, проверяемые тестами, включая проверки ошибочных аргументов
 - не изменяй тесты и не пытайся обходить ограничения безопасности
 - для изменения файла действительно вызывай write_file, а не просто предлагай код
 - перед завершением задачи обязательно попробуй запустить тесты через Bash
 - если тесты не прошли, изучи ошибки и попробуй исправить проблему
 - не утверждай, что тесты прошли, если не получил подтверждение от инструмента
 - если инструмент вернул ошибку, учитывай её при выборе следующего действия
+- если пользователь отклонил действие, учитывай отказ и выбирай дальнейшие шаги
 
 важно:
 - пользователь общается исключительно на русском языке
 - итоговый ответ должен быть написан на русском языке
 """
+
+TOOL_CALL_RETRY_MESSAGE = (
+    "предыдущий ответ содержит вызов инструмента обычным текстом, "
+    "поэтому этот вызов не был выполнен\n"
+    "для действия используй настоящий tool call из предоставленного списка, "
+    "не записывай вызов в content или в блок кода\n"
+    "после изменения файла проверь результат через Bash\n"
+    "если действие невозможно или больше не требуется, объясни это обычным текстом"
+)
+MAX_TOOL_CALL_RETRIES = 2
+VERIFY_TESTS_PROMPT = (
+    "успешное завершение этого запуска требует проверки тестов через Bash\n"
+    "после последнего изменения файлов выполни python3 -m unittest -v "
+    "в рабочей директории проекта и получи код завершения 0\n"
+    "вызывай инструменты через tool_calls, не выводи код вместо изменения файла"
+)
+VERIFY_TESTS_RETRY_MESSAGE = (
+    "задача ещё не подтверждена: после последних изменений нет успешного "
+    "запуска тестов через Bash\n"
+    "сейчас вызови нужный инструмент через tool_calls: если исправление ещё "
+    "не записано, используй write_file с полным содержимым файла, "
+    "затем Bash с командой python3 -m unittest -v и cwd='.'\n"
+    "если тесты не пройдут, исправь причину и запусти их снова\n"
+    "не отвечай блоком кода или описанием предполагаемых изменений"
+)
+
 
 class AgentError(Exception):
     pass
@@ -68,6 +97,8 @@ class AgentEngine:
         after_tool_execution: Callable[
             [ToolCall, ToolResult], None
         ] | None = None,
+        mode: str = "auto",
+        verify_tests: bool = False,
     ):
         if (
             not isinstance(max_steps, int)
@@ -78,16 +109,30 @@ class AgentEngine:
                 "количество шагов должно быть положительным целым числом"
             )
 
+        if mode not in ("safe", "auto"):
+            raise ValueError(
+                "неизвестный режим выполнения"
+            )
+
         self.llm = llm
         self.registry = registry
         self.executor = executor
         self.max_steps = max_steps
         self.on_tool_result = on_tool_result
         self.after_tool_execution = after_tool_execution
+        self.mode = mode
+        self.verify_tests = verify_tests
 
-        self.store = store or RunStore(":memory:")
+        self.store = (
+            store
+            if store is not None
+            else RunStore(":memory:")
+        )
 
-    def _snapshot(self, run_id: str) -> AgentRunResult:
+    def _snapshot(
+        self,
+        run_id: str,
+    ) -> AgentRunResult:
         run = self.store.get_run(run_id)
 
         return AgentRunResult(
@@ -101,7 +146,10 @@ class AgentEngine:
             run_id=run_id,
         )
 
-    def _execute_tool(self, call: ToolCall) -> ToolResult:
+    def _execute_tool(
+        self,
+        call: ToolCall,
+    ) -> ToolResult:
         try:
             return self.executor.execute(call)
 
@@ -112,6 +160,87 @@ class AgentEngine:
                 success=False,
                 error="внутренняя ошибка при выполнении инструмента",
             )
+
+    def _is_text_tool_call(self, content: str | None) -> bool:
+        text = (content or "").strip()
+        lines = text.splitlines()
+
+        if (
+            len(lines) >= 3
+            and lines[0] in ("```", "```python", "```py")
+            and lines[-1] == "```"
+        ):
+            text = "\n".join(lines[1:-1])
+
+        try:
+            statements = ast.parse(text).body
+        except (SyntaxError, ValueError, RecursionError):
+            return False
+
+        names = {
+            tool["function"]["name"]
+            for tool in self.registry.openai_tools()
+        }
+
+        return bool(statements) and all(
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id in names
+            for statement in statements
+        )
+
+    @staticmethod
+    def _tests_verified(messages: list[dict[str, Any]]) -> bool:
+        calls = {}
+        verified = False
+        seen = set()
+
+        for message in messages:
+            if message["role"] == "assistant":
+                for call in message.get("tool_calls", []):
+                    calls[call["id"]] = call["function"]
+            elif message["role"] == "tool":
+                call_id = message["tool_call_id"]
+                if call_id in seen:
+                    continue
+                seen.add(call_id)
+                call = calls.get(call_id, {})
+                name = call.get("name")
+                result = json.loads(message["content"])
+                if name in ("write_file", "delete_file", "Bash"):
+                    verified = False
+                if name == "Bash" and result.get("success"):
+                    arguments = json.loads(call["arguments"])
+                    data = result.get("data") or {}
+                    verified = (
+                        arguments.get("command") in (
+                            "python3 -m unittest -v",
+                            "python -m unittest -v",
+                        )
+                        and arguments.get("cwd") == "."
+                        and data.get("exit_code") == 0
+                        and not data.get("timed_out")
+                        and not data.get("truncated")
+                    )
+
+        return verified
+
+    @staticmethod
+    def _requires_approval(
+        mode: str,
+        tool_name: str,
+    ) -> bool:
+        if tool_name == "delete_file":
+            return True
+
+        if mode == "safe":
+            return tool_name in (
+                "write_file",
+                "Bash",
+            )
+
+        return False
 
     def run(
         self,
@@ -129,14 +258,24 @@ class AgentEngine:
         self.store.create_run(
             run_id=run_id,
             prompt=prompt,
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=(
+                SYSTEM_PROMPT + "\n" + VERIFY_TESTS_PROMPT
+                if self.verify_tests else SYSTEM_PROMPT
+            ),
             max_steps=self.max_steps,
+            mode=self.mode,
         )
 
         return self._drive(run_id)
 
-    def resume(self, run_id: str) -> AgentRunResult:
+    def resume(
+        self,
+        run_id: str,
+    ) -> AgentRunResult:
         run = self.store.get_run(run_id)
+
+        if run["status"] == "waiting_approval":
+            return self._snapshot(run_id)
 
         if run["status"] != "running":
             return self._snapshot(run_id)
@@ -150,19 +289,66 @@ class AgentEngine:
 
         return self._drive(run_id)
 
+    def approve(
+        self,
+        run_id: str,
+    ) -> AgentRunResult:
+        self.store.decide_approval(
+            run_id,
+            "approve",
+        )
+
+        return self._drive(run_id)
+
+    def reject(
+        self,
+        run_id: str,
+    ) -> AgentRunResult:
+        approval = self.store.get_pending_approval(
+            run_id
+        )
+
+        result = self.store.decide_approval(
+            run_id,
+            "reject",
+        )
+
+        if (
+            approval is not None
+            and result is not None
+            and self.on_tool_result is not None
+        ):
+            call = ToolCall(
+                id=approval["call_id"],
+                name=approval["name"],
+                arguments=json.loads(
+                    approval["arguments"]
+                ),
+            )
+
+            self.on_tool_result(call, result)
+
+        return self._drive(run_id)
+
     def resolve(
         self,
         run_id: str,
         action: str,
     ) -> AgentRunResult:
-        self.store.resolve(run_id, action)
+        self.store.resolve(
+            run_id,
+            action,
+        )
 
         if action == "abort":
             return self._snapshot(run_id)
 
         return self._drive(run_id)
 
-    def _drive(self, run_id: str) -> AgentRunResult:
+    def _drive(
+        self,
+        run_id: str,
+    ) -> AgentRunResult:
         while True:
             run = self.store.get_run(run_id)
 
@@ -227,6 +413,52 @@ class AgentEngine:
                         "неизвестное состояние вызова инструмента"
                     )
 
+                validation_error = self.executor.validate(
+                    call
+                )
+
+                if validation_error is not None:
+                    self.store.complete_without_execution(
+                        run_id,
+                        position,
+                        validation_error,
+                    )
+
+                    if self.on_tool_result is not None:
+                        self.on_tool_result(
+                            call,
+                            validation_error,
+                        )
+
+                    continue
+
+                if self._requires_approval(
+                    run["mode"],
+                    call.name,
+                ):
+                    approval = self.store.get_approval(
+                        run_id,
+                        call.id,
+                    )
+
+                    if approval is None:
+                        self.store.request_approval(
+                            run_id,
+                            call.id,
+                        )
+
+                        return self._snapshot(run_id)
+
+                    if approval == "pending":
+                        raise StoreError(
+                            "запуск ожидает подтверждения действия"
+                        )
+
+                    if approval != "approved":
+                        raise StoreError(
+                            "некорректное состояние подтверждения"
+                        )
+
                 self.store.begin_attempt(
                     run_id,
                     call.id,
@@ -248,7 +480,10 @@ class AgentEngine:
                 )
 
                 if self.on_tool_result is not None:
-                    self.on_tool_result(call, result)
+                    self.on_tool_result(
+                        call,
+                        result,
+                    )
 
                 continue
 
@@ -256,12 +491,43 @@ class AgentEngine:
                 self.store.mark_limit(run_id)
                 return self._snapshot(run_id)
 
+            messages = self.store.get_messages(run_id)
             response = self.llm.complete(
-                messages=self.store.get_messages(run_id),
+                messages=messages,
                 tools=self.registry.openai_tools(),
+                tool_choice=(
+                    "required"
+                    if messages[-1].get("role") == "system"
+                    and messages[-1].get("content") in (
+                        TOOL_CALL_RETRY_MESSAGE,
+                        VERIFY_TESTS_RETRY_MESSAGE,
+                    )
+                    else "auto"
+                ),
             )
 
-            if (
+            retry_message = None
+            error = None
+            verification_missing = (
+                VERIFY_TESTS_PROMPT in messages[0]["content"]
+                and not self._tests_verified(messages)
+            )
+
+            if not response.tool_calls and verification_missing:
+                retries = sum(
+                    message.get("role") == "system"
+                    and message.get("content") == VERIFY_TESTS_RETRY_MESSAGE
+                    for message in messages
+                )
+                if retries < MAX_TOOL_CALL_RETRIES:
+                    retry_message = VERIFY_TESTS_RETRY_MESSAGE
+                else:
+                    error = (
+                        "задача не завершена: модель не подтвердила "
+                        "исправление успешным запуском тестов через Bash"
+                    )
+
+            elif (
                 not response.tool_calls
                 and not (response.content or "").strip()
             ):
@@ -269,7 +535,27 @@ class AgentEngine:
                     "модель не вернула итоговый ответ"
                 )
 
+            elif (
+                not response.tool_calls
+                and self._is_text_tool_call(response.content)
+            ):
+                retries = sum(
+                    message.get("role") == "system"
+                    and message.get("content") == TOOL_CALL_RETRY_MESSAGE
+                    for message in messages
+                )
+
+                if retries < MAX_TOOL_CALL_RETRIES:
+                    retry_message = TOOL_CALL_RETRY_MESSAGE
+                else:
+                    error = (
+                        "модель повторно вернула вызов инструмента текстом, "
+                        "задача не завершена, текстовый вызов не выполнен"
+                    )
+
             self.store.record_response(
                 run_id,
                 response,
+                retry_message=retry_message,
+                error=error,
             )

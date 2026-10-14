@@ -47,14 +47,16 @@ class RunStore:
                 max_steps INTEGER NOT NULL,
                 model_calls INTEGER NOT NULL DEFAULT 0,
                 tool_calls INTEGER NOT NULL DEFAULT 0,
-                final_answer TEXT
+                final_answer TEXT,
+                mode TEXT NOT NULL DEFAULT 'auto'
             );
 
             CREATE TABLE IF NOT EXISTS messages (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
                 payload TEXT NOT NULL,
-                FOREIGN KEY (run_id) REFERENCES runs(run_id)
+                FOREIGN KEY (run_id)
+                    REFERENCES runs(run_id)
             );
 
             CREATE TABLE IF NOT EXISTS tool_calls (
@@ -66,7 +68,8 @@ class RunStore:
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 result TEXT,
                 PRIMARY KEY (run_id, call_id),
-                FOREIGN KEY (run_id) REFERENCES runs(run_id)
+                FOREIGN KEY (run_id)
+                    REFERENCES runs(run_id)
             );
 
             CREATE TABLE IF NOT EXISTS pending_calls (
@@ -96,9 +99,35 @@ class RunStore:
                 run_id TEXT NOT NULL,
                 call_id TEXT NOT NULL,
                 action TEXT NOT NULL,
-                FOREIGN KEY (run_id) REFERENCES runs(run_id)
+                FOREIGN KEY (run_id)
+                    REFERENCES runs(run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS approvals (
+                run_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (run_id, call_id),
+                FOREIGN KEY (run_id, call_id)
+                    REFERENCES tool_calls(run_id, call_id)
             );
         """)
+
+        columns = {
+            row["name"]
+            for row in self.db.execute(
+                "PRAGMA table_info(runs)"
+            )
+        }
+
+        if "mode" not in columns:
+            with self.db:
+                self.db.execute(
+                    """
+                    ALTER TABLE runs
+                    ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto'
+                    """
+                )
 
     @staticmethod
     def _json(value: Any) -> str:
@@ -127,16 +156,22 @@ class RunStore:
         prompt: str,
         system_prompt: str,
         max_steps: int,
+        mode: str = "auto",
     ) -> None:
+        if mode not in ("safe", "auto"):
+            raise StoreError(
+                "неизвестный режим выполнения"
+            )
+
         with self.db:
             self.db.execute(
                 """
                 INSERT INTO runs (
-                    run_id, status, max_steps
+                    run_id, status, max_steps, mode
                 )
-                VALUES (?, 'running', ?)
+                VALUES (?, 'running', ?, ?)
                 """,
-                (run_id, max_steps),
+                (run_id, max_steps, mode),
             )
 
             self._append_message(
@@ -157,7 +192,11 @@ class RunStore:
 
     def get_run(self, run_id: str) -> dict:
         row = self.db.execute(
-            "SELECT * FROM runs WHERE run_id = ?",
+            """
+            SELECT *
+            FROM runs
+            WHERE run_id = ?
+            """,
             (run_id,),
         ).fetchone()
 
@@ -190,7 +229,18 @@ class RunStore:
         self,
         run_id: str,
         response: LLMResponse,
+        retry_message: str | None = None,
+        error: str | None = None,
     ) -> None:
+        if (
+            (retry_message is not None and error is not None)
+            or (
+                response.tool_calls
+                and (retry_message is not None or error is not None)
+            )
+        ):
+            raise StoreError("некорректное решение по ответу модели")
+
         with self.db:
             run = self.get_run(run_id)
 
@@ -203,7 +253,8 @@ class RunStore:
                 """
                 SELECT 1
                 FROM pending_calls
-                WHERE run_id = ? AND delivered = 0
+                WHERE run_id = ?
+                  AND delivered = 0
                 LIMIT 1
                 """,
                 (run_id,),
@@ -215,7 +266,10 @@ class RunStore:
                 )
 
             self.db.execute(
-                "DELETE FROM pending_calls WHERE run_id = ?",
+                """
+                DELETE FROM pending_calls
+                WHERE run_id = ?
+                """,
                 (run_id,),
             )
 
@@ -234,15 +288,27 @@ class RunStore:
             )
 
             if not response.tool_calls:
+                if retry_message is not None:
+                    self._append_message(
+                        run_id,
+                        {"role": "system", "content": retry_message},
+                    )
+                    return
+
                 self.db.execute(
                     """
                     UPDATE runs
-                    SET status = 'completed',
+                    SET status = ?,
                         final_answer = ?
                     WHERE run_id = ?
                     """,
-                    (response.content, run_id),
+                    (
+                        "failed" if error is not None else "completed",
+                        error if error is not None else response.content,
+                        run_id,
+                    ),
                 )
+
                 return
 
             for position, call in enumerate(
@@ -265,8 +331,11 @@ class RunStore:
                     self.db.execute(
                         """
                         INSERT INTO tool_calls (
-                            run_id, call_id, name,
-                            arguments, status
+                            run_id,
+                            call_id,
+                            name,
+                            arguments,
+                            status
                         )
                         VALUES (?, ?, ?, ?, 'queued')
                         """,
@@ -299,7 +368,9 @@ class RunStore:
                 self.db.execute(
                     """
                     INSERT INTO pending_calls (
-                        run_id, position, call_id,
+                        run_id,
+                        position,
+                        call_id,
                         override_result
                     )
                     VALUES (?, ?, ?, ?)
@@ -375,7 +446,10 @@ class RunStore:
             self.db.execute(
                 """
                 INSERT INTO tool_attempts (
-                    run_id, call_id, attempt_no, status
+                    run_id,
+                    call_id,
+                    attempt_no,
+                    status
                 )
                 VALUES (?, ?, ?, 'started')
                 """,
@@ -479,13 +553,312 @@ class RunStore:
                 result.to_message(),
             )
 
-    def mark_uncertain(self, run_id: str) -> bool:
+    def complete_without_execution(
+        self,
+        run_id: str,
+        position: int,
+        result: ToolResult,
+    ) -> None:
+        encoded = self._json(asdict(result))
+
+        with self.db:
+            pending = self.next_pending(run_id)
+
+            if (
+                pending is None
+                or pending["position"] != position
+                or pending["call_id"] != result.tool_call_id
+                or pending["status"] != "queued"
+            ):
+                raise StoreError(
+                    "некорректное состояние вызова инструмента"
+                )
+
+            self.db.execute(
+                """
+                UPDATE tool_calls
+                SET status = 'completed',
+                    result = ?
+                WHERE run_id = ? AND call_id = ?
+                """,
+                (
+                    encoded,
+                    run_id,
+                    result.tool_call_id,
+                ),
+            )
+
+            self.db.execute(
+                """
+                UPDATE pending_calls
+                SET delivered = 1
+                WHERE run_id = ?
+                  AND position = ?
+                """,
+                (run_id, position),
+            )
+
+            self.db.execute(
+                """
+                UPDATE runs
+                SET tool_calls = tool_calls + 1
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            )
+
+            self._append_message(
+                run_id,
+                result.to_message(),
+            )
+
+    def get_approval(
+        self,
+        run_id: str,
+        call_id: str,
+    ) -> str | None:
+        row = self.db.execute(
+            """
+            SELECT status
+            FROM approvals
+            WHERE run_id = ? AND call_id = ?
+            """,
+            (run_id, call_id),
+        ).fetchone()
+
+        return row["status"] if row else None
+
+    def get_pending_approval(
+        self,
+        run_id: str,
+    ) -> dict | None:
+        row = self.db.execute(
+            """
+            SELECT
+                a.call_id,
+                c.name,
+                c.arguments
+            FROM approvals a
+            JOIN tool_calls c
+              ON c.run_id = a.run_id
+             AND c.call_id = a.call_id
+            WHERE a.run_id = ?
+              AND a.status = 'pending'
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+
+        return dict(row) if row else None
+
+    def request_approval(
+        self,
+        run_id: str,
+        call_id: str,
+    ) -> None:
+        with self.db:
+            run = self.get_run(run_id)
+
+            if run["status"] != "running":
+                raise StoreError(
+                    "запуск не находится в состоянии выполнения"
+                )
+
+            pending = self.next_pending(run_id)
+
+            if pending is None or pending["call_id"] != call_id:
+                raise StoreError(
+                    "ожидающий вызов инструмента не найден"
+                )
+
+            if pending["status"] != "queued":
+                raise StoreError(
+                    "инструмент уже начал выполнение"
+                )
+
+            approval = self.get_approval(
+                run_id,
+                call_id,
+            )
+
+            if approval is not None:
+                raise StoreError(
+                    "подтверждение уже запрашивалось"
+                )
+
+            self.db.execute(
+                """
+                INSERT INTO approvals (
+                    run_id,
+                    call_id,
+                    status
+                )
+                VALUES (?, ?, 'pending')
+                """,
+                (run_id, call_id),
+            )
+
+            self.db.execute(
+                """
+                UPDATE runs
+                SET status = 'waiting_approval'
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            )
+
+    def decide_approval(
+        self,
+        run_id: str,
+        action: str,
+    ) -> ToolResult | None:
+        if action not in ("approve", "reject"):
+            raise StoreError(
+                "неизвестное решение пользователя"
+            )
+
+        with self.db:
+            run = self.get_run(run_id)
+
+            if run["status"] != "waiting_approval":
+                raise StoreError(
+                    "запуск не ожидает подтверждения действия"
+                )
+
+            approval = self.get_pending_approval(run_id)
+
+            if approval is None:
+                raise StoreError(
+                    "ожидающее подтверждение не найдено"
+                )
+
+            call_id = approval["call_id"]
+
+            pending = self.next_pending(run_id)
+
+            if (
+                pending is None
+                or pending["call_id"] != call_id
+                or pending["status"] != "queued"
+            ):
+                raise StoreError(
+                    "некорректное состояние подтверждения"
+                )
+
+            new_status = (
+                "approved"
+                if action == "approve"
+                else "rejected"
+            )
+
+            self.db.execute(
+                """
+                UPDATE approvals
+                SET status = ?
+                WHERE run_id = ? AND call_id = ?
+                """,
+                (
+                    new_status,
+                    run_id,
+                    call_id,
+                ),
+            )
+
+            self.db.execute(
+                """
+                INSERT INTO decisions (
+                    run_id,
+                    call_id,
+                    action
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    run_id,
+                    call_id,
+                    action,
+                ),
+            )
+
+            result = None
+
+            if action == "reject":
+                result = ToolResult(
+                    tool_call_id=call_id,
+                    name=approval["name"],
+                    success=False,
+                    error=(
+                        "пользователь отклонил выполнение инструмента"
+                    ),
+                )
+
+                encoded = self._json(
+                    asdict(result)
+                )
+
+                self.db.execute(
+                    """
+                    UPDATE tool_calls
+                    SET status = 'completed',
+                        result = ?
+                    WHERE run_id = ? AND call_id = ?
+                    """,
+                    (
+                        encoded,
+                        run_id,
+                        call_id,
+                    ),
+                )
+
+                self.db.execute(
+                    """
+                    UPDATE pending_calls
+                    SET delivered = 1
+                    WHERE run_id = ?
+                      AND position = ?
+                    """,
+                    (
+                        run_id,
+                        pending["position"],
+                    ),
+                )
+
+                self.db.execute(
+                    """
+                    UPDATE runs
+                    SET tool_calls = tool_calls + 1
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                )
+
+                self._append_message(
+                    run_id,
+                    result.to_message(),
+                )
+
+            self.db.execute(
+                """
+                UPDATE runs
+                SET status = 'running'
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            )
+
+            return result
+
+    def mark_uncertain(
+        self,
+        run_id: str,
+    ) -> bool:
         with self.db:
             rows = self.db.execute(
                 """
                 SELECT call_id, attempt_count
                 FROM tool_calls
-                WHERE run_id = ? AND status = 'started'
+                WHERE run_id = ?
+                  AND status = 'started'
                 """,
                 (run_id,),
             ).fetchall()
@@ -527,12 +900,20 @@ class RunStore:
 
             return bool(rows)
 
-    def get_uncertain(self, run_id: str) -> dict | None:
+    def get_uncertain(
+        self,
+        run_id: str,
+    ) -> dict | None:
         row = self.db.execute(
             """
-            SELECT call_id, name, arguments, attempt_count
+            SELECT
+                call_id,
+                name,
+                arguments,
+                attempt_count
             FROM tool_calls
-            WHERE run_id = ? AND status = 'uncertain'
+            WHERE run_id = ?
+              AND status = 'uncertain'
             ORDER BY rowid
             LIMIT 1
             """,
@@ -578,7 +959,11 @@ class RunStore:
 
             self.db.execute(
                 """
-                INSERT INTO decisions (run_id, call_id, action)
+                INSERT INTO decisions (
+                    run_id,
+                    call_id,
+                    action
+                )
                 VALUES (?, ?, ?)
                 """,
                 (run_id, call_id, action),
@@ -614,7 +999,9 @@ class RunStore:
                     ),
                 )
 
-                encoded = self._json(asdict(result))
+                encoded = self._json(
+                    asdict(result)
+                )
 
                 self.db.execute(
                     """
@@ -719,7 +1106,10 @@ class RunStore:
             (run_id, call_id),
         ).fetchall()
 
-        return [dict(row) for row in rows]
+        return [
+            dict(row)
+            for row in rows
+        ]
 
     def get_decisions(
         self,
@@ -735,7 +1125,10 @@ class RunStore:
             (run_id,),
         ).fetchall()
 
-        return [dict(row) for row in rows]
+        return [
+            dict(row)
+            for row in rows
+        ]
 
     def close(self) -> None:
         self.db.close()

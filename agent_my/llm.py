@@ -24,6 +24,7 @@ class LLMClient(Protocol):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
     ) -> LLMResponse:
         ...
 
@@ -49,6 +50,7 @@ class OpenAICompatibleClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
     ) -> LLMResponse:
         if not messages:
             raise LLMError("нельзя отправить пустую историю сообщений")
@@ -60,7 +62,7 @@ class OpenAICompatibleClient:
 
         if tools:
             request["tools"] = tools
-            request["tool_choice"] = "auto"
+            request["tool_choice"] = tool_choice
 
         try:
             response = self._client.chat.completions.create(
@@ -183,10 +185,12 @@ class FakeLLM:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
     ) -> LLMResponse:
         self.calls.append({
             "messages": deepcopy(messages),
             "tools": deepcopy(tools),
+            "tool_choice": tool_choice,
         })
 
         if not self._responses:

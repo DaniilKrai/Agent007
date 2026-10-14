@@ -2,13 +2,30 @@
 import io
 import unittest
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent_my.cli import main
+from agent_my.cli import main, print_run_result
 from agent_my.models import LLMResponse, ToolCall
 
 class CliTest(unittest.TestCase):
+    def test_failed_run_prints_reason(self):
+        error_output = io.StringIO()
+        result = SimpleNamespace(
+            run_id="failed_run",
+            status="failed",
+            model_calls=3,
+            tool_calls=0,
+            final_answer="модель вернула вызов текстом, задача не завершена",
+        )
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(error_output):
+            code = print_run_result(None, result)
+
+        self.assertEqual(code, 1)
+        self.assertIn(result.final_answer, error_output.getvalue())
+
     def test_help(self):
         output = io.StringIO()
 

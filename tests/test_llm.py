@@ -117,6 +117,24 @@ class OpenAICompatibleClientTest(unittest.TestCase):
         self.assertEqual(kwargs["tools"], tools)
         self.assertEqual(kwargs["tool_choice"], "auto")
 
+    def test_required_tool_choice(self):
+        self.sdk.chat.completions.create.return_value = make_sdk_response(
+            tool_calls=[make_sdk_call("read", "read_file", '{"path":"order.py"}')],
+            finish_reason="tool_calls",
+        )
+        tools = [{"type": "function", "function": {
+            "name": "read_file",
+            "parameters": {"type": "object", "properties": {}},
+        }}]
+
+        response = self.client.complete(self.messages, tools=tools, tool_choice="required")
+
+        self.assertEqual(response.tool_calls[0].name, "read_file")
+        self.assertEqual(
+            self.sdk.chat.completions.create.call_args.kwargs["tool_choice"],
+            "required",
+        )
+
     def test_multiple_tool_calls(self):
         calls = [
             make_sdk_call(

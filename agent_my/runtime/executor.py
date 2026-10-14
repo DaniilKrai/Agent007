@@ -15,7 +15,22 @@ class Executor:
         self.registry = registry
         self.policy = policy
 
-    def execute(self, call: ToolCall) -> ToolResult:
+    def _error(
+        self,
+        call: ToolCall,
+        message: str,
+    ) -> ToolResult:
+        return ToolResult(
+            tool_call_id=call.id,
+            name=call.name,
+            success=False,
+            error=message,
+        )
+
+    def validate(
+        self,
+        call: ToolCall,
+    ) -> ToolResult | None:
         definitions = {
             item["function"]["name"]: item["function"]
             for item in self.registry.openai_tools()
@@ -24,14 +39,20 @@ class Executor:
         definition = definitions.get(call.name)
 
         if definition is None:
-            return self.registry.execute(call)
+            return self._error(
+                call,
+                f"неизвестный инструмент: {call.name}",
+            )
 
         validator = Draft202012Validator(
             definition["parameters"]
         )
 
         if not validator.is_valid(call.arguments):
-            return self.registry.execute(call)
+            return self._error(
+                call,
+                "некорректные аргументы инструмента",
+            )
 
         try:
             if call.name == "Bash":
@@ -62,11 +83,14 @@ class Executor:
             FileNotFoundError,
             NotADirectoryError,
         ) as exc:
-            return ToolResult(
-                tool_call_id=call.id,
-                name=call.name,
-                success=False,
-                error=str(exc),
-            )
+            return self._error(call, str(exc))
+
+        return None
+
+    def execute(self, call: ToolCall) -> ToolResult:
+        error = self.validate(call)
+
+        if error is not None:
+            return error
 
         return self.registry.execute(call)

@@ -252,6 +252,210 @@ class AgentEngineTest(unittest.TestCase):
             5,
         )
 
+    def test_text_call_recovery_with_safe_approvals(self):
+        fake, engine = self.make_engine([
+            LLMResponse(content=None, tool_calls=(
+                ToolCall("read_order", "read_file", {"path": "order.py"}),
+                ToolCall("read_tests", "read_file", {"path": "test_order.py"}),
+            )),
+            LLMResponse(content=(
+                "содержимое файла order.py после исправления:\n"
+                "```python\n" + self.corrected_code + "```"
+            )),
+            LLMResponse(content=None, tool_calls=(
+                ToolCall("write", "write_file", {
+                    "path": "order.py",
+                    "content": self.corrected_code,
+                }),
+            )),
+            LLMResponse(content=None, tool_calls=(
+                ToolCall("test", "Bash", {
+                    "command": "python3 -m unittest -v",
+                    "cwd": ".",
+                }),
+            )),
+            LLMResponse(content="исправление выполнено, тесты проходят"),
+        ])
+        engine.mode = "safe"
+        engine.verify_tests = True
+
+        result = engine.run("исправь расчёт стоимости и запусти тесты")
+
+        self.assertEqual(result.status, "waiting_approval")
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(result.tool_calls, 2)
+        self.assertEqual(
+            (self.workspace / "order.py").read_text(encoding="utf-8"),
+            self.original_code,
+        )
+        self.assertEqual(fake.calls[2]["messages"][-2]["role"], "assistant")
+        self.assertEqual(fake.calls[2]["messages"][-1]["role"], "system")
+        self.assertIn("задача ещё не подтверждена", fake.calls[2]["messages"][-1]["content"])
+        self.assertEqual(fake.calls[2]["tool_choice"], "required")
+
+        result = engine.approve(result.run_id)
+
+        self.assertEqual(result.status, "waiting_approval")
+        self.assertEqual(result.tool_calls, 3)
+        self.assertEqual(
+            engine.store.get_pending_approval(result.run_id)["name"],
+            "Bash",
+        )
+        self.assertEqual(
+            (self.workspace / "order.py").read_text(encoding="utf-8"),
+            self.corrected_code,
+        )
+        self.assertFalse(any(call.name == "Bash" for call, _ in self.events))
+
+        result = engine.approve(result.run_id)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.model_calls, 5)
+        self.assertEqual(result.tool_calls, 4)
+        self.assertEqual(self.events[-1][1].data["exit_code"], 0)
+        self.assertIn("OK", self.events[-1][1].data["stderr"])
+        self.assertEqual(
+            (self.workspace / "test_order.py").read_text(encoding="utf-8"),
+            self.test_code,
+        )
+
+    def test_unverified_success_is_not_completed(self):
+        fake, engine = self.make_engine([
+            LLMResponse(content="всё исправлено, тесты проходят"),
+        ] * 3)
+        engine.verify_tests = True
+
+        result = engine.run("исправь расчёт")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.tool_calls, 0)
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(fake.calls[1]["tool_choice"], "required")
+        self.assertEqual(self.events, [])
+
+    def test_failed_tests_do_not_allow_completion(self):
+        fake, engine = self.make_engine([
+            LLMResponse(content=None, tool_calls=(
+                ToolCall("test", "Bash", {
+                    "command": "python3 -m unittest -v", "cwd": ".",
+                }),
+            )),
+            *[LLMResponse(content="готово")] * 3,
+        ])
+        engine.verify_tests = True
+
+        result = engine.run("исправь расчёт")
+
+        self.assertEqual(result.status, "failed")
+        self.assertNotEqual(self.events[0][1].data["exit_code"], 0)
+
+    def test_write_after_tests_requires_new_verification(self):
+        (self.workspace / "order.py").write_text(self.corrected_code, encoding="utf-8")
+        fake, engine = self.make_engine([
+            LLMResponse(content=None, tool_calls=(
+                ToolCall("test", "Bash", {
+                    "command": "python3 -m unittest -v", "cwd": ".",
+                }),
+                ToolCall("write", "write_file", {
+                    "path": "order.py", "content": self.original_code,
+                }),
+            )),
+            *[LLMResponse(content="готово")] * 3,
+        ])
+        engine.verify_tests = True
+
+        result = engine.run("проверь расчёт")
+
+        self.assertEqual(self.events[0][1].data["exit_code"], 0)
+        self.assertEqual(result.status, "failed")
+
+    def test_text_calls_fail_after_two_retries(self):
+        response = LLMResponse(content='write_file("order.py", "wrong code")')
+        fake, engine = self.make_engine([response] * 3)
+
+        result = engine.run("исправь файл")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(result.tool_calls, 0)
+        self.assertEqual(len(fake.calls), 3)
+        self.assertIn("задача не завершена", result.final_answer)
+        self.assertEqual(self.events, [])
+        self.assertEqual(
+            (self.workspace / "order.py").read_text(encoding="utf-8"),
+            self.original_code,
+        )
+
+    def test_text_call_retry_respects_model_limit(self):
+        fake, engine = self.make_engine([
+            LLMResponse(content='read_file("order.py")'),
+        ], max_steps=1)
+
+        result = engine.run("прочитай файл")
+
+        self.assertEqual(result.status, "limit_reached")
+        self.assertEqual(result.model_calls, 1)
+        self.assertEqual(result.tool_calls, 0)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_fenced_text_call_arguments_are_not_executed(self):
+        fake, engine = self.make_engine([
+            LLMResponse(content=(
+                "```python\n"
+                'write_file("order.py", __import__("pathlib").Path('
+                f"{str(self.workspace / 'unexpected.txt')!r}"
+                ').write_text("unexpected"))\n'
+                "```"
+            )),
+            LLMResponse(content="не удалось выполнить задачу"),
+        ])
+
+        result = engine.run("исправь файл")
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.model_calls, 2)
+        self.assertEqual(result.tool_calls, 0)
+        self.assertEqual(len(fake.calls), 2)
+        self.assertFalse((self.workspace / "unexpected.txt").exists())
+        self.assertEqual(
+            (self.workspace / "order.py").read_text(encoding="utf-8"),
+            self.original_code,
+        )
+
+    def test_normal_text_answers_do_not_trigger_retry(self):
+        for content in (
+            "работа завершена",
+            'не удалось выполнить write_file("order.py", "код") из-за запрета',
+            "```python\ndef calculate_total(prices, discount):\n    return 0\n```",
+        ):
+            with self.subTest(content=content):
+                fake, engine = self.make_engine([LLMResponse(content=content)])
+
+                result = engine.run("проверь проект")
+
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(result.final_answer, content)
+                self.assertEqual(len(fake.calls), 1)
+
+    def test_real_tool_call_with_text_is_executed_once(self):
+        fake, engine = self.make_engine([
+            LLMResponse(
+                content='write_file("order.py", "код")',
+                tool_calls=(ToolCall("write", "write_file", {
+                    "path": "order.py",
+                    "content": self.corrected_code,
+                }),),
+            ),
+            LLMResponse(content="файл исправлен"),
+        ])
+
+        result = engine.run("исправь файл")
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.model_calls, 2)
+        self.assertEqual(result.tool_calls, 1)
+        self.assertEqual(len(self.events), 1)
+
     def test_multiple_tool_calls(self):
         responses = [
             LLMResponse(

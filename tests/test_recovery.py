@@ -121,6 +121,75 @@ class RecoveryTest(unittest.TestCase):
     def crash(call, result):
         raise SimulatedCrash()
 
+    def test_text_call_retry_survives_restart(self):
+        response = LLMResponse(content='write_file("order.py", "value = 3")')
+        fake, engine = self.make_engine([response])
+
+        with self.assertRaises(LLMError):
+            engine.run("измени файл", run_id="text_retry")
+
+        self.assertEqual(self.store.get_run("text_retry")["status"], "running")
+        self.assertEqual(self.store.get_run("text_retry")["model_calls"], 1)
+        self.restart_store()
+        fake, engine = self.make_engine([response, response])
+
+        result = engine.resume("text_retry")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(result.tool_calls, 0)
+        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(fake.calls[0]["messages"][-1]["role"], "system")
+        self.assertEqual(
+            (self.workspace / "order.py").read_text(encoding="utf-8"),
+            "value = 1\n",
+        )
+
+        self.restart_store()
+        fake, engine = self.make_engine([])
+        restored = engine.resume("text_retry")
+
+        self.assertEqual(restored.status, "failed")
+        self.assertEqual(restored.final_answer, result.final_answer)
+        self.assertEqual(fake.calls, [])
+
+    def test_text_call_retry_continues_with_real_call_after_restart(self):
+        fake, engine = self.make_engine([
+            LLMResponse(content='read_file("order.py")'),
+        ])
+
+        with self.assertRaises(LLMError):
+            engine.run("прочитай файл", run_id="text_retry_success")
+
+        self.restart_store()
+        fake, engine = self.make_engine([
+            self.make_call("read", "read_file", path="order.py"),
+            LLMResponse(content="файл прочитан"),
+        ])
+
+        result = engine.resume("text_retry_success")
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(result.tool_calls, 1)
+        self.assertIn("value = 1", fake.calls[1]["messages"][-1]["content"])
+
+    def test_test_verification_requirement_survives_restart(self):
+        fake, engine = self.make_engine([LLMResponse(content="готово")])
+        engine.verify_tests = True
+
+        with self.assertRaises(LLMError):
+            engine.run("исправь файл", run_id="verify_tests")
+
+        self.restart_store()
+        fake, engine = self.make_engine([LLMResponse(content="готово")] * 2)
+
+        result = engine.resume("verify_tests")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(fake.calls[0]["tool_choice"], "required")
+
     def test_completed_run_is_persisted(self):
         fake, engine = self.make_engine([
             LLMResponse(content="задача завершена"),
@@ -416,11 +485,22 @@ class RecoveryTest(unittest.TestCase):
             after_tool_execution=self.crash,
         )
 
+        result = engine.run(
+            "удали файл",
+            run_id="test_abort",
+        )
+
+        self.assertEqual(
+            result.status,
+            "waiting_approval",
+        )
+
+        self.assertTrue(
+            (self.workspace / "order.py").exists()
+        )
+
         with self.assertRaises(SimulatedCrash):
-            engine.run(
-                "удали файл",
-                run_id="test_abort",
-            )
+            engine.approve("test_abort")
 
         self.restart_store()
 
@@ -440,7 +520,10 @@ class RecoveryTest(unittest.TestCase):
             "abort",
         )
 
-        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            result.status,
+            "failed",
+        )
 
         self.assertEqual(len(new_fake.calls), 0)
 
@@ -449,7 +532,7 @@ class RecoveryTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            decisions[0]["action"],
+            decisions[-1]["action"],
             "abort",
         )
 

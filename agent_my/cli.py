@@ -120,6 +120,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="максимальное количество обращений к модели",
     )
 
+    run_parser.add_argument(
+        "--mode",
+        choices=["safe", "auto"],
+        default="safe",
+        help="режим выполнения агента",
+    )
+
+    run_parser.add_argument(
+        "--no-verify-tests",
+        action="store_true",
+        help="разрешить текстовое завершение без проверки тестов для задач анализа",
+    )
+
     resume_parser = subparsers.add_parser(
         "resume",
         help="продолжить сохранённый запуск",
@@ -154,6 +167,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     status_parser.add_argument(
+        "run_id",
+        type=str,
+    )
+
+    approve_parser = subparsers.add_parser(
+        "approve",
+        help="подтвердить ожидающее действие агента",
+        add_help=False,
+    )
+
+    approve_parser.add_argument(
+        "run_id",
+        type=str,
+    )
+
+    reject_parser = subparsers.add_parser(
+        "reject",
+        help="отклонить ожидающее действие агента",
+        add_help=False,
+    )
+
+    reject_parser.add_argument(
         "run_id",
         type=str,
     )
@@ -282,6 +317,8 @@ def print_tool_result(
 
 def build_engine(
     max_steps: int = 20,
+    mode: str = "safe",
+    verify_tests: bool = True,
 ) -> AgentEngine:
     settings = LLMSettings.from_env()
 
@@ -310,9 +347,10 @@ def build_engine(
         executor=executor,
         store=store,
         max_steps=max_steps,
+        mode=mode,
+        verify_tests=verify_tests,
         on_tool_result=print_tool_result,
     )
-
 
 def print_run_result(
     engine: AgentEngine,
@@ -341,10 +379,60 @@ def print_run_result(
 
     if result.status == "failed":
         print(
-            "запуск завершён с ошибкой",
+            result.final_answer or "запуск завершён с ошибкой",
             file=sys.stderr,
         )
         return 1
+
+    if result.status == "waiting_approval":
+        approval = engine.store.get_pending_approval(
+            result.run_id
+        )
+
+        print("агент ожидает подтверждения действия")
+
+        if approval is not None:
+            print(
+                f"инструмент: {approval['name']}"
+            )
+
+            arguments = json.loads(
+                approval["arguments"]
+            )
+
+            if "path" in arguments:
+                print(
+                    f"путь: {arguments['path']}"
+                )
+
+            if "command" in arguments:
+                print(
+                    f"команда: {arguments['command']}"
+                )
+
+            if "cwd" in arguments:
+                print(
+                    f"рабочая директория: {arguments['cwd']}"
+                )
+
+            if approval["name"] == "write_file":
+                content = arguments.get("content", "")
+                print(
+                    f"размер нового содержимого: "
+                    f"{len(content.encode('utf-8'))} байт"
+                )
+
+        print(
+            "для подтверждения: "
+            f"python -m agent_my approve {result.run_id}"
+        )
+
+        print(
+            "для отказа: "
+            f"python -m agent_my reject {result.run_id}"
+        )
+
+        return 3
 
     if result.status == "waiting_resolution":
         call = engine.store.get_uncertain(
@@ -386,7 +474,9 @@ def print_run_result(
 
 def run_agent(args: argparse.Namespace) -> int:
     engine = build_engine(
-        max_steps=args.max_steps
+        max_steps=args.max_steps,
+        mode=args.mode,
+        verify_tests=not args.no_verify_tests,
     )
 
     run_id = str(uuid.uuid4())
@@ -432,6 +522,27 @@ def resolve_action(
         result,
     )
 
+def approve_action(run_id: str) -> int:
+    engine = build_engine()
+
+    result = engine.approve(run_id)
+
+    return print_run_result(
+        engine,
+        result,
+    )
+
+
+def reject_action(run_id: str) -> int:
+    engine = build_engine()
+
+    result = engine.reject(run_id)
+
+    return print_run_result(
+        engine,
+        result,
+    )
+
 
 def show_status(run_id: str) -> int:
     store = RunStore(STATE_DB)
@@ -447,6 +558,16 @@ def show_status(run_id: str) -> int:
         print(
             f"вызовов инструментов: {run['tool_calls']}"
         )
+
+        print(f"режим выполнения: {run['mode']}")
+
+        if run["status"] == "waiting_approval":
+            approval = store.get_pending_approval(run_id)
+
+            if approval is not None:
+                print(
+                    f"ожидает подтверждения: {approval['name']}"
+                )
 
         if run["status"] == "waiting_resolution":
             call = store.get_uncertain(run_id)
@@ -484,6 +605,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "status":
             return show_status(args.run_id)
+
+        if args.command == "approve":
+            return approve_action(args.run_id)
+
+        if args.command == "reject":
+            return reject_action(args.run_id)
 
         parser.print_help()
         return 0
